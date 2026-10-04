@@ -1,0 +1,5 @@
+source,bucket,expected
+samples/myVideo1.mp4,A,acquire.com;trustmrr.com
+reels/02_tumbler_gated.mp4,D,Stanley Quencher
+reels/03_cafe_tokyo.mp4,C,Aman Tokyo
+reels/04_no_info.mp4,E,

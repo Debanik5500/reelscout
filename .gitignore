@@ -1,0 +1,80 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Benchmarks & test outputs
+benchmark_*.json
+benchmark_*.txt
+benchmark_*.log
+benchmark_*.py
+batch_test_*.py
+test_real_*.py
+
+# Media files
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Cookies & session data
+cookies.txt
+
+# Cache
+.cache/
+
+# Test outputs
+test_reels/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Coverage
+.coverage
+htmlcov/
+
+# Docker
+docker-compose.override.yml

@@ -1,0 +1,44 @@
+app = "reelscout-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "server/Dockerfile"
+
+[env]
+  REDIS_URL = "redis://localhost:6379"
+  MAX_WORKERS = "1"
+  REELSCOUT_LLM = "xai"
+  REELSCOUT_VISION_MODEL = "grok-3"
+  REELSCOUT_TEXT_LLM = "groq"
+  REELSCOUT_TEXT_MODEL = "qwen/qwen3.8-27b"
+  REELSCOUT_WHISPER = "tiny"
+  REELSCOUT_MAX_FRAMES = "10"
+  REELSCOUT_OCR_WORKERS = "2"
+  REELSCOUT_RESOLVE = "off"
+
+[processes]
+  app = "gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080 --timeout 600"
+  worker = "python -c \"import redis; from rq import Worker, Queue; Worker(['reels'], connection=redis.from_url('redis://localhost:6379')).work()\""
+
+[mounts]
+  source = "reelscout_cache"
+  destination = "/tmp/reelscout_uploads"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+[vm]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

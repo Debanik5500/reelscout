@@ -1,0 +1,13 @@
+requests>=2.31
+numpy>=1.24
+opencv-python-headless>=4.8
+faster-whisper>=1.0        # local speech-to-text
+pytesseract>=0.3.10        # needs the `tesseract` binary (or use rapidocr-onnxruntime)
+yt-dlp                     # URL ingestion
+instaloader                # fallback ingestion / tagged users / location
+ddgs                       # open-source multi-engine web search (Python >= 3.10)
+pytest
+
+# ---- optional, heavier / more fragile (off unless you pass the flag) ----
+# PicImageSearch           # --image-search : reverse image search via Google Lens / Yandex / Bing (scraping)
+# geoclip                  # --geo          : image -> GPS guess (needs torch)

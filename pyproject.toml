@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reelscout"
+version = "0.1.0"
+description = "Find the website/repo/product a reel is about"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "faster-whisper>=1.0",
+    "pytesseract>=0.3.10",
+    "yt-dlp",
+    "instaloader",
+    "ddgs",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["reelscout*"]

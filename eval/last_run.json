@@ -1,0 +1,90 @@
+{
+ "full": {
+  "summary": {
+   "A": {
+    "n": 1,
+    "top1": 0.0,
+    "top3": 0.0,
+    "abstain": 1.0,
+    "wrong_confident": 0.0
+   },
+   "ALL": {
+    "n": 4,
+    "top1": 0.0,
+    "top3": 0.0,
+    "abstain": 1.0,
+    "wrong_confident": 0.0
+   },
+   "C": {
+    "n": 1,
+    "top1": 0.0,
+    "top3": 0.0,
+    "abstain": 1.0,
+    "wrong_confident": 0.0
+   },
+   "D": {
+    "n": 1,
+    "top1": 0.0,
+    "top3": 0.0,
+    "abstain": 1.0,
+    "wrong_confident": 0.0
+   },
+   "E": {
+    "n": 1,
+    "top1": 0.0,
+    "top3": 0.0,
+    "abstain": 1.0,
+    "wrong_confident": 0.0
+   }
+  },
+  "rows": [
+   {
+    "correct": false,
+    "top3": false,
+    "abstained": true,
+    "wrong_confident": false,
+    "error": "[Errno 2] No such file or directory: 'samples/myVideo1.mp4'",
+    "source": "samples/myVideo1.mp4",
+    "bucket": "A",
+    "expected": [
+     "acquire.com",
+     "trustmrr.com"
+    ]
+   },
+   {
+    "correct": false,
+    "top3": false,
+    "abstained": true,
+    "wrong_confident": false,
+    "error": "[Errno 2] No such file or directory: 'reels/02_tumbler_gated.mp4'",
+    "source": "reels/02_tumbler_gated.mp4",
+    "bucket": "D",
+    "expected": [
+     "Stanley Quencher"
+    ]
+   },
+   {
+    "correct": false,
+    "top3": false,
+    "abstained": true,
+    "wrong_confident": false,
+    "error": "[Errno 2] No such file or directory: 'reels/03_cafe_tokyo.mp4'",
+    "source": "reels/03_cafe_tokyo.mp4",
+    "bucket": "C",
+    "expected": [
+     "Aman Tokyo"
+    ]
+   },
+   {
+    "correct": false,
+    "top3": false,
+    "abstained": true,
+    "wrong_confident": false,
+    "error": "[Errno 2] No such file or directory: 'reels/04_no_info.mp4'",
+    "source": "reels/04_no_info.mp4",
+    "bucket": "E",
+    "expected": []
+   }
+  ]
+ }
+}

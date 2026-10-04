@@ -1,0 +1,29 @@
+[build]
+builder = "docker"
+dockerfilePath = "server/Dockerfile"
+
+[deploy]
+healthcheckPath = "/api/v1/health"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "api"
+port = 8000
+
+[[services]]
+name = "worker"
+startCommand = "python -c \"import redis; from rq import Worker, Queue; Worker(['reels'], connection=redis.from_url('redis://localhost:6379')).work()\""
+
+[variables]
+REDIS_URL = "redis://localhost:6379"
+MAX_WORKERS = "1"
+REELSCOUT_LLM = "xai"
+REELSCOUT_VISION_MODEL = "grok-3"
+REELSCOUT_TEXT_LLM = "groq"
+REELSCOUT_TEXT_MODEL = "qwen/qwen3.8-27b"
+REELSCOUT_WHISPER = "tiny"
+REELSCOUT_MAX_FRAMES = "10"
+REELSCOUT_OCR_WORKERS = "2"
+REELSCOUT_RESOLVE = "off"

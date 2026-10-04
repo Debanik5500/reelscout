@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MAX_WORKERS=2
+      - REELSCOUT_LLM=xai
+      - REELSCOUT_VISION_MODEL=grok-3
+      - REELSCOUT_TEXT_LLM=groq
+      - REELSCOUT_TEXT_MODEL=qwen/qwen3.8-27b
+      - REELSCOUT_WHISPER=tiny
+      - REELSCOUT_MAX_FRAMES=10
+      - REELSCOUT_OCR_WORKERS=2
+      - REELSCOUT_RESOLVE=off
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./server:/app/server
+    command: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 600
+
+  worker:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MAX_WORKERS=2
+      - REELSCOUT_LLM=xai
+      - REELSCOUT_VISION_MODEL=grok-3
+      - REELSCOUT_TEXT_LLM=groq
+      - REELSCOUT_TEXT_MODEL=qwen/qwen3.8-27b
+      - REELSCOUT_WHISPER=tiny
+      - REELSCOUT_MAX_FRAMES=10
+      - REELSCOUT_OCR_WORKERS=2
+      - REELSCOUT_RESOLVE=off
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: python -c "import redis; from rq import Worker, Queue; Worker(['reels'], connection=redis.from_url('redis://redis:6379')).work()"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+volumes:
+  redis_data:
