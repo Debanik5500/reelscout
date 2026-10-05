@@ -13,6 +13,7 @@ Both are best-effort: Instagram changes often and may demand a logged-in session
 from __future__ import annotations
 
 import re
+import tempfile
 from pathlib import Path
 
 
@@ -112,3 +113,73 @@ def fetch(source: str, workdir: Path, cookies_from_browser: str | None = None, c
             errors.append(f"{name}: {e}")
     raise RuntimeError("Could not ingest the URL (" + "; ".join(errors) + "). "
                        "Try --cookies-from-browser chrome, or download the reel and pass the file path.")
+
+
+def download_instagram(url: str, workdir: Path | None = None) -> dict | None:
+    """Download Instagram content (reel or carousel).
+    
+    Returns dict with:
+    - is_reel: bool
+    - video_path: str (if reel)
+    - images: list[bytes] (if carousel)
+    - metadata: dict
+    """
+    if workdir is None:
+        workdir = Path(tempfile.gettempdir()) / "reelscout_ig"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        path, meta = fetch(url, workdir)
+        
+        # Check if it's a carousel (multiple images)
+        # yt-dlp returns entries for carousels
+        import yt_dlp
+        base = {"quiet": True, "no_warnings": True, "format": "best[height<=720]/best"}
+        with yt_dlp.YoutubeDL(base) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            if "entries" in info:
+                # Carousel post - multiple images/videos
+                images = []
+                for entry in info["entries"]:
+                    if entry and entry.get("url"):
+                        # Download each image
+                        try:
+                            entry_opts = dict(base, outtmpl=str(workdir / f"carousel_%(id)s.%(ext)s"))
+                            with yt_dlp.YoutubeDL(entry_opts) as ydl2:
+                                ydl2.download([entry["url"]])
+                            # Find downloaded file
+                            for f in workdir.glob(f"carousel_{entry['id']}.*"):
+                                if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp'):
+                                    images.append(f.read_bytes())
+                        except Exception:
+                            pass
+                
+                if images:
+                    return {
+                        "is_reel": False,
+                        "images": images,
+                        "metadata": meta,
+                    }
+        
+        # Single video (reel)
+        if path.suffix.lower() in ('.mp4', '.mov', '.mkv', '.webm'):
+            return {
+                "is_reel": True,
+                "video_path": str(path),
+                "metadata": meta,
+            }
+        
+        # Single image
+        if path.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp'):
+            return {
+                "is_reel": False,
+                "images": [path.read_bytes()],
+                "metadata": meta,
+            }
+            
+    except Exception as e:
+        print(f"Instagram download error: {e}")
+        return None
+    
+    return None

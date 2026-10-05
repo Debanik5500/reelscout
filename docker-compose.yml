@@ -9,57 +9,41 @@ services:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 10s
+      timeout: 5s
       retries: 5
 
   api:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
+    build: .
     ports:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379
       - MAX_WORKERS=2
-      - REELSCOUT_LLM=xai
-      - REELSCOUT_VISION_MODEL=grok-3
-      - REELSCOUT_TEXT_LLM=groq
-      - REELSCOUT_TEXT_MODEL=qwen/qwen3.8-27b
-      - REELSCOUT_WHISPER=tiny
-      - REELSCOUT_MAX_FRAMES=10
-      - REELSCOUT_OCR_WORKERS=2
-      - REELSCOUT_RESOLVE=off
+      - API_KEY=${API_KEY:-}
+    volumes:
+      - reel_scout_data:/data/ReelScoutData
     depends_on:
       redis:
         condition: service_healthy
-    volumes:
-      - ./server:/app/server
-    command: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 600
+    restart: unless-stopped
 
   worker:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
+    build: .
+    command: python -m rq worker --url redis://redis:6379 reels multipost
     environment:
       - REDIS_URL=redis://redis:6379
-      - MAX_WORKERS=2
-      - REELSCOUT_LLM=xai
-      - REELSCOUT_VISION_MODEL=grok-3
-      - REELSCOUT_TEXT_LLM=groq
-      - REELSCOUT_TEXT_MODEL=qwen/qwen3.8-27b
-      - REELSCOUT_WHISPER=tiny
-      - REELSCOUT_MAX_FRAMES=10
-      - REELSCOUT_OCR_WORKERS=2
-      - REELSCOUT_RESOLVE=off
+    volumes:
+      - reel_scout_data:/data/ReelScoutData
     depends_on:
       redis:
         condition: service_healthy
-    command: python -c "import redis; from rq import Worker, Queue; Worker(['reels'], connection=redis.from_url('redis://redis:6379')).work()"
+    restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
 
 volumes:
   redis_data:
+  reel_scout_data:

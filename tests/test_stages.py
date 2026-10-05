@@ -40,12 +40,12 @@ def test_text_stage_stays_on_ollama_when_only_research_is_overridden(monkeypatch
         used.append((("vision" if images else "text"), st.llm))
         return "s", [], {"calls": 1}, []
     monkeypatch.setattr(pipeline.reason, "reason", fake_reason)
-    monkeypatch.setattr(pipeline.ocr, "ocr_frames", lambda f: [])
+    monkeypatch.setattr(pipeline.ocr, "ocr_frames", lambda f, workers=1: [])
     monkeypatch.setattr(pipeline.resolve, "resolve", lambda *a, **k: dict(candidates=[], hits=[], image_hits=[], geo=None, errors=[], usage={"calls": 2}, model="openai:gpt-4.1"))
-    r = pipeline.analyze(str(DATA / "text_video.mp4"), Settings(llm="ollama", cache_dir=Path(tempfile.mkdtemp()), max_frames=4), caption="comment LINK please")
-    assert used == [("text", "ollama"), ("vision", "ollama")]
-    assert [s["stage"] for s in r["llm"]["stages"]] == ["text", "vision", "research"]
-    assert r["llm"]["stages"][2]["model"] == "openai:gpt-4.1"
+    r = pipeline.analyze(str(DATA / "text_video.mp4"), Settings(llm="ollama", resolve="auto", cache_dir=Path(tempfile.mkdtemp()), max_frames=4), caption="comment LINK please")
+    assert used == [("vision", "ollama")]   # weak local evidence -> vision runs directly, text tier skipped as redundant
+    assert [s["stage"] for s in r["llm"]["stages"]] == ["vision", "research"]
+    assert r["llm"]["stages"][1]["model"] == "openai:gpt-4.1"
 
 
 def test_cli_llm_flag_drops_model_from_the_old_provider():
@@ -59,7 +59,7 @@ def test_cli_llm_flag_drops_model_from_the_old_provider():
 
 def _local_evidence(monkeypatch, ocr_lines, transcript):
     from reelscout import media, verify
-    monkeypatch.setattr(pipeline.ocr, "ocr_frames", lambda f: ocr_lines)
+    monkeypatch.setattr(pipeline.ocr, "ocr_frames", lambda f, workers=1: ocr_lines)
     monkeypatch.setattr(pipeline.media, "extract_audio", lambda v, w: True)
     monkeypatch.setattr(pipeline.asr, "transcribe", lambda *a, **k: transcript)
     monkeypatch.setattr(verify, "verify", lambda c, web=True: setattr(c, "verification", dict(ok=True)))
@@ -88,9 +88,9 @@ def test_policy_always_forces_the_llm_even_when_decisive(monkeypatch):
     assert calls == [1]
 
 
-def test_single_source_evidence_is_not_decisive(monkeypatch):
-    r, calls = _run_policy(monkeypatch, BOTH[0], [], "auto")        # seen on screen only
-    assert calls == [1]
+def test_persistent_verified_single_source_counts_as_decisive(monkeypatch):
+    r, calls = _run_policy(monkeypatch, BOTH[0], [], "auto")        # OCR-only but seen on 3 frames + verified
+    assert calls == [] and r["llm"]["stages"][0] == dict(stage="text", model="local (skipped: decisive)", calls=0)
 
 
 def test_policy_never_skips_text_call_and_local_only_config_stays_fully_local(monkeypatch):

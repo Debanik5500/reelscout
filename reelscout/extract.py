@@ -40,6 +40,20 @@ class Candidate:
     def sources(self) -> set[str]:
         return {e["source"] for e in self.evidence}
 
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "name": self.name,
+            "url": self.url,
+            "confidence": self.confidence,
+            "alternates": self.alternates,
+            "spoken_as": self.spoken_as,
+            "evidence": self.evidence,
+            "verification": self.verification,
+            "extra": self.extra,
+            "score": self.score,
+        }
+
 
 def _clean_domain(d: str) -> str:
     d = d.lower().strip(".,;:)")

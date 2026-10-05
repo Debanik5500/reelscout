@@ -53,22 +53,23 @@ def test_pipeline_runs_resolve_tier_when_everything_else_is_weak(monkeypatch):
         return "s", [], {}, ["clue"]
     found = extract.Candidate("github_repo", "a/b", confidence=0.7, evidence=[dict(source="search", text="match")])
     monkeypatch.setattr(pipeline.reason, "reason", fake_reason)
-    monkeypatch.setattr(pipeline.ocr, "ocr_frames", lambda f: [])
-    monkeypatch.setattr(pipeline.resolve, "resolve", lambda clues, s, fr, st: dict(candidates=[found], hits=[dict(title="t", url="u", query="q")], image_hits=[], geo=None, errors=[], usage={"in": 1}))
+    monkeypatch.setattr(pipeline.ocr, "ocr_frames", lambda f, workers=1: [])
+    monkeypatch.setattr(pipeline.resolve, "resolve", lambda clues, s, fr, st, *a, **k: dict(candidates=[found], hits=[dict(title="t", url="u", query="q")], image_hits=[], geo=None, errors=[], usage={"in": 1}))
     monkeypatch.setattr(verify, "verify", lambda c, web=True: setattr(c, "verification", dict(ok=True)))
-    r = pipeline.analyze(str(DATA / "text_video.mp4"), Settings(llm="gemini", cache_dir=Path(tempfile.mkdtemp()), max_frames=4))
+    r = pipeline.analyze(str(DATA / "text_video.mp4"), Settings(llm="gemini", resolve="auto", cache_dir=Path(tempfile.mkdtemp()), max_frames=4))
     assert r["resolution"]["ran"] and r["candidates"][0]["name"] == "a/b" and r["candidates"][0]["confidence"] >= 0.65
 
 
 def _analyze_stubbed(monkeypatch, caption, seen):
     from reelscout import ocr
     monkeypatch.setattr(pipeline.reason, "reason", lambda *a, **k: ("s", [], {}, []))
-    monkeypatch.setattr(ocr, "ocr_frames", lambda f: [])
-    def fake_resolve(clues, summary, frames, st):
+    monkeypatch.setattr(ocr, "ocr_frames", lambda f, workers=1: [])
+    monkeypatch.setattr(pipeline.asr, "transcribe", lambda *a, **k: [])
+    def fake_resolve(clues, summary, frames, st, *a, **k):
         seen.append(st.image_search)
         return dict(candidates=[], hits=[], image_hits=[], geo=None, errors=[], usage={})
     monkeypatch.setattr(pipeline.resolve, "resolve", fake_resolve)
-    st = Settings(llm="gemini", cache_dir=Path(tempfile.mkdtemp()), max_frames=4)
+    st = Settings(llm="gemini", resolve="auto", cache_dir=Path(tempfile.mkdtemp()), max_frames=4)
     return pipeline.analyze(str(DATA / "text_video.mp4"), st, caption=caption)
 
 
@@ -80,7 +81,7 @@ def test_gated_reel_turns_on_image_search_and_reports_unidentified(monkeypatch):
 
 def test_ungated_reel_does_not_force_image_search(monkeypatch):
     seen = []
-    pipeline_result = _analyze_stubbed(monkeypatch, "nice day", seen)
+    pipeline_result = _analyze_stubbed(monkeypatch, "", seen)
     assert seen == []                  # no clues, not gated -> resolve tier not even entered
 
 

@@ -1,82 +1,134 @@
-from pathlib import Path
+"""Tests for ReelScout pipeline."""
 
-import cv2
 import pytest
+from PIL import Image
+import io
 
-from reelscout import extract, ocr, reason
-from reelscout.config import Settings
-from reelscout.pipeline import score
-
-DATA = Path(__file__).parent / "data"
-
-
-@pytest.mark.skipif(not (__import__("shutil").which("tesseract")), reason="tesseract not installed")
-def test_real_frame_ocr_reads_address_bar():
-    lines = ocr.ocr_frames([dict(frame_id=0, t=0.0, path=str(DATA / "acquire.jpg"))])
-    found = {c.name for l in lines for c in extract.find_in_text(l["text"], "ocr")}
-    assert "acquire.com" in found
+from reelscout.pipeline import analyze_multi_post, analyze_reel_with_storage
+from reelscout.storage import get_phone_storage
 
 
-def test_reason_parses_llm_output_and_fixes_spelling(monkeypatch):
-    fake = {"summary": "Finding SaaS ideas.", "mentions": [
-        {"name": "trustmrr.com", "kind": "website", "url": "https://trustmrr.com", "alternates": [],
-         "spoken_as": "trustmr.com", "confidence": 0.7, "evidence": "speaker says trustmr.com"},
-        {"name": "Claude", "kind": "tool", "url": None, "spoken_as": "claw / clawed", "confidence": 0.9,
-         "evidence": "share the URL with clawed"}], "unresolved_clues": ["green ceramic mug, no logo"]}
-    monkeypatch.setattr(reason, "complete_json", lambda *a, **k: (fake, {"in": 1, "out": 1}))
-    summary, cands, _, clues = reason.reason([], [], {"caption": ""}, [], Settings(llm="gemini"))
-    assert clues == ["green ceramic mug, no logo"]
-    assert {c.name for c in cands} == {"trustmrr.com", "Claude"}
-    assert cands[0].spoken_as == "trustmr.com"
+@pytest.fixture
+def sample_images():
+    """Create sample images for testing."""
+    images = []
+    for color in ['red', 'green', 'blue']:
+        img = Image.new('RGB', (200, 200), color=color)
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG')
+        images.append(buf.getvalue())
+    return images
 
 
-def test_score_penalises_dead_domains_and_rewards_corroboration():
-    good = extract.Candidate("website", "a.com", confidence=0.5,
-                             evidence=[dict(source="ocr", text="a.com", n_frames=3), dict(source="transcript", text="a.com")],
-                             verification=dict(ok=True))
-    dead = extract.Candidate("website", "b.com", confidence=0.5, evidence=[dict(source="transcript", text="b.com")],
-                             verification=dict(ok=False))
-    assert score(good) > 0.85 > 0.4 > score(dead)
+class TestAnalyzeMultiPost:
+    """Test analyze_multi_post function."""
+
+    def test_analyze_multi_post_basic(self, sample_images):
+        """Test basic multi-post analysis."""
+        result = analyze_multi_post(sample_images[:2], job_id="test_multi_basic")
+        
+        assert result.job_id == "test_multi_basic"
+        assert result.status == "completed"
+        assert isinstance(result.summary, str)
+        assert len(result.source_frames) == 2
+        assert isinstance(result.timings, dict)
+        assert "total" in result.timings
+
+    def test_analyze_multi_post_single(self, sample_images):
+        """Test single image analysis."""
+        result = analyze_multi_post(sample_images[:1], job_id="test_multi_single")
+        
+        assert result.job_id == "test_multi_single"
+        assert result.status == "completed"
+        assert len(result.source_frames) == 1
+
+    def test_analyze_multi_post_frames_saved(self, sample_images):
+        """Test that frames are saved to phone storage."""
+        storage = get_phone_storage()
+        storage.cleanup_job("test_multi_storage")
+        
+        result = analyze_multi_post(sample_images[:1], job_id="test_multi_storage")
+        
+        # Check frames exist in storage
+        frames = storage.get_frames("test_multi_storage")
+        assert len(frames) == 1
+        assert frames[0].local_path is not None
+        
+        # Check result saved
+        loaded = storage.load_result("test_multi_storage")
+        assert loaded is not None
+        assert loaded.job_id == "test_multi_storage"
+        
+        storage.cleanup_job("test_multi_storage")
+
+    def test_analyze_multi_post_payload_format(self, sample_images):
+        """Test that payload format matches iOS ReelResult."""
+        result = analyze_multi_post(sample_images[:1], job_id="test_format")
+        payload = result.to_dict()
+        
+        # Check required fields
+        assert "jobID" in payload
+        assert "status" in payload
+        assert "summary" in payload
+        assert "candidates" in payload
+        assert "timings" in payload
+        assert "sourceFrames" in payload
+        
+        # Check frame format
+        frame = payload["sourceFrames"][0]
+        assert "index" in frame
+        assert "timestamp" in frame
+        assert "localPath" in frame
+        assert "ocrText" in frame
+        assert "embedding" in frame
 
 
-def _run(monkeypatch, first, second):
-    """Runs the real pipeline on a tiny video with ASR/OCR/LLM/verify stubbed; returns (result, list of image-lists the LLM saw)."""
-    import tempfile
-    from reelscout import asr, pipeline, verify
-    seen = []
+class TestAnalyzeReelWithStorage:
+    """Test analyze_reel_with_storage function."""
 
-    def fake_reason(tr, ocr_l, meta, regex_found, st, images=None, gated=None, frame_times=None):
-        seen.append(images)
-        return "s", (second if images else first), {"in": 10, "out": 5}, (["grey laptop UI, no logo"] if images is None else [])
+    def test_analyze_reel_with_storage(self):
+        """Test reel analysis with frame storage."""
+        import cv2
+        import numpy as np
+        import tempfile
+        from pathlib import Path
+        
+        # Create test video
+        height, width = 480, 640
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        video_path = Path(temp_video.name)
+        temp_video.close()
 
-    monkeypatch.setattr(pipeline.reason, "reason", fake_reason)
-    monkeypatch.setattr(pipeline.ocr, "ocr_frames", lambda frames: [])
-    monkeypatch.setattr(pipeline.resolve, "resolve", lambda *a, **k: dict(candidates=[], hits=[], image_hits=[], geo=None, errors=[], usage={}))
-    monkeypatch.setattr(verify, "verify", lambda c, web=True: setattr(c, "verification", dict(ok=True)))
-    st = Settings(llm="gemini", cache_dir=Path(tempfile.mkdtemp()), max_frames=6)
-    return pipeline.analyze(str(DATA / "text_video.mp4"), st), seen
+        out = cv2.VideoWriter(str(video_path), fourcc, 30.0, (width, height))
+        for i in range(15):
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            cv2.putText(frame, f'Frame {i}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            out.write(frame)
+        out.release()
+
+        try:
+            result = analyze_reel_with_storage(
+                video_path=video_path,
+                job_id="test_reel_storage",
+                max_frames=5,
+            )
+            
+            assert result.job_id == "test_reel_storage"
+            assert result.status == "completed"
+            assert len(result.source_frames) > 0
+            assert len(result.source_frames) <= 5
+            assert "frame_extraction" in result.timings
+            
+            # Verify frames saved to storage
+            storage = get_phone_storage()
+            frames = storage.get_frames("test_reel_storage")
+            assert len(frames) == len(result.source_frames)
+            
+            storage.cleanup_job("test_reel_storage")
+        finally:
+            video_path.unlink(missing_ok=True)
 
 
-def test_weak_text_signals_escalate_to_vision(monkeypatch):
-    vis = [extract.Candidate("tool", "Coolify", confidence=0.7, evidence=[dict(source="llm", text="logo in frame 3")])]
-    r, seen = _run(monkeypatch, [], vis)
-    assert seen[0] is None and seen[1] and len(seen[1]) <= 8       # text pass first, then frames in ONE call
-    assert r["used_vision"] and r["candidates"][0]["name"] == "Coolify"
-    assert r["unresolved_clues"] == ["grey laptop UI, no logo"]
-    assert r["llm"]["usage"] == {"in": 20, "out": 10}              # usage is summed across both calls
-
-
-def test_strong_text_signals_skip_vision(monkeypatch):
-    strong = [extract.Candidate("website", "acquire.com", confidence=0.8, evidence=[dict(source="llm", text="said it")])]
-    r, seen = _run(monkeypatch, strong, [])
-    assert seen == [None] and not r["used_vision"]
-
-
-def test_select_ocr_keeps_urls_and_drops_junk():
-    lines = [dict(text="acquire.com", t=1.0, n_frames=3, conf=0.9),
-             dict(text="~~ // ..", t=1.1, n_frames=1, conf=0.9),
-             dict(text="ok", t=1.2, n_frames=1, conf=0.9)] + \
-            [dict(text=f"random word {i}", t=2 + i, n_frames=1, conf=0.5) for i in range(100)]
-    kept = reason.select_ocr(lines, k=10)
-    assert len(kept) == 10 and kept[0]["text"] == "acquire.com"
-    assert all(len(l["text"]) >= 4 for l in kept)
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

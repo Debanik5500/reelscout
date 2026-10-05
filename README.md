@@ -17,17 +17,14 @@ Find the **website / GitHub repo / product / place** a reel is about, even when 
 
 Nothing is lost if the LLM is down/rate-limited: stages 1-5 + 7 still return results.
 
-## Stage 9: turning clues into a name (all open source / free)
+## Stage 9: turning the unresolved subject into a name (all open source / free)
 
-When the text and frame passes still leave nothing convincing, `unresolved_clues` go through:
+When the text and frame passes still leave nothing convincing, the subject is identified **without reverse image search**:
 
-| Tool | For | Notes |
+| Path | For | Notes |
 |------|-----|-------|
-| SearXNG (self-hosted) or `ddgs` | any clue -> web results | SearXNG is the robust one; `ddgs` is a scraper with backend failover |
-| GitHub search API | dev-tool clues | searches name + description + README, free (token raises the limit) |
-| OpenStreetMap Nominatim | named places | 1 req/s policy |
-| `--image-search` (PicImageSearch) | products, UIs, anything visual | scrapes Google Lens / Yandex / Bing; can break or be bot-blocked |
-| `--geo` (GeoCLIP) | travel reels with no text | region/city-level guess only; needs torch |
+| **A. Visual identification** (`visualid.identify`, default) | anything the frames show but nobody says | vision-LLM pass describes the frames as a ranked *visual fingerprint* (distinctive features, high/medium/low) + hypotheses — caption, transcript and on-screen text are clues, not ground truth; ordinary **text** search is then driven by combinations of the rarest features (alternate names, local terminology, other languages, technical terms) with the transcript as context; a second LLM pass cross-checks candidates feature-by-feature, seeks disconfirmation, and assigns CONFIRMED / HIGHLY LIKELY / LIKELY / POSSIBLE / UNKNOWN |
+| **B. Clue resolve** (`resolve.resolve`, fallback) | `unresolved_clues` → SearXNG / `ddgs`, GitHub search API, OSM Nominatim | runs when visual identification found nothing and there are clues (or the reel is gated, `--image-search` or `--geo`) |
 
 The final LLM step may only return what the search results support; "unknown" is an allowed answer.
 
@@ -63,8 +60,10 @@ Whisper (speech) and OCR are always local and never touch an LLM. The model prov
 |------|-----------|------|------|
 | 1. read the evidence, fix mishearings, list entities | `TEXT` | unless local evidence is already decisive (see above) | `reason.reason` |
 | 2. same, plus up to 8 frames | `VISION` | only if call 1 + verification left nothing >= 0.65 | `reason.reason(images=...)` |
-| 3. write search queries from the clues | `RESEARCH` | only if still weak and there are clues (or the reel is gated) | `resolve.make_queries` |
-| 4. pick an answer from search results / page text | `RESEARCH` | right after 3 | `resolve.resolve` |
+| 3. describe frames as a visual fingerprint + hypotheses + queries | `VISION` | only if still weak and frames exist | `visualid.identify` (pass 1) |
+| 4. cross-check search hits against the fingerprint | `RESEARCH` | right after 3, if search returned hits | `visualid.identify` (pass 2) |
+| 5. write search queries from the clues | `RESEARCH` | only if visual identification found nothing and there are clues (or the reel is gated) | `resolve.make_queries` |
+| 6. pick an answer from search results / page text | `RESEARCH` | right after 5 | `resolve.resolve` |
 
 Verification (HTTP / GitHub / PyPI / OpenStreetMap), regex, search and image search make no LLM calls. The CLI prints one `llm[stage]` line per stage with the exact `provider:model` and token counts.
 Each stage can use a different provider/model via `REELSCOUT_TEXT_*`, `REELSCOUT_VISION_*`, `REELSCOUT_RESEARCH_*` (see `.env.example`).

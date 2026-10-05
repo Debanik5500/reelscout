@@ -9,8 +9,9 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import asr, extract, ingest, media, ocr, reason, resolve, verify
+from . import asr, extract, ingest, media, ocr, reason, resolve, verify, visualid
 from .config import Settings
+from .storage import get_phone_storage, FrameData, Candidate, ReelResult
 
 
 _GENERIC_TERMS = {"app", "tool", "ai", "vibe", "coded", "coding", "code", "debug", "cheat", "tutorial", "guide", "how to", "free", "open", "source", "github", "repo", "project", "build", "make", "create", "new", "best", "top", "latest", "update", "version", "release", "demo", "showcase", "example", "sample"}
@@ -303,7 +304,31 @@ def analyze(source: str, settings: Settings | None = None, caption: str = "",
     if st.resolve != "off" and (weak or llm_entities_need_search):
         effective_clues = clues or _fallback_clues(transcript, ocr_lines, caption)
         use_img = st.image_search or bool(gated)
-        if effective_clues or use_img or st.geo:
+        vis = None
+        # Path A: visual identification -- frames -> visual fingerprint
+        # -> TEXT web search (no reverse image search). Only when the
+        # caption / transcript / OCR left the subject unresolved.
+        if weak and frames and st.vision != "off":
+            t = time.time()
+            vshots = media.pick_for_vision(frames, work / "visualid", 4)
+            _log(f"[visualid] {len(vshots)} frame(s) -> fingerprint -> text search")
+            try:
+                vis = visualid.identify(effective_clues, summary, vshots, st,
+                                        transcript, ocr_lines, caption)
+            except Exception as e:
+                vis = None
+                _log(f"[visualid] failed: {e}")
+            if vis is not None:
+                cands = extract.merge(cands + vis["candidates"])
+                for k, v in vis.get("usage", {}).items():
+                    usage[k] = usage.get(k, 0) + v
+                if vis.get("usage"):
+                    stages_log.append(dict(stage="visualid", model=vis.get("model", ""), **vis["usage"]))
+                finish()
+                stage("visualid", t)
+        # Path B: clue-based resolve (+ optional reverse image search /
+        # geolocation). Skipped when visual identification resolved it.
+        if not (vis and vis["candidates"]) and (effective_clues or use_img or st.geo):
             t = time.time()
             rst = dataclasses.replace(st, image_search=use_img)
             rframes = [x["path"] for x in media.pick_for_vision(frames, work / "resolve", 3)]
@@ -316,7 +341,17 @@ def analyze(source: str, settings: Settings | None = None, caption: str = "",
                 stages_log.append(dict(stage="research", model=res.get("model", ""), **res["usage"]))
             finish()
             resolution = dict(ran=True, hits=res["hits"], image_hits=res["image_hits"], geo=res["geo"], errors=res["errors"])
+            if vis is not None:
+                resolution["fingerprint"] = vis["fingerprint"]
+                resolution["hypotheses"] = vis["hypotheses"]
+                resolution["queries"] = vis["queries"] + res["queries"]
+                resolution["hits"] = vis["hits"] + res["hits"]
+                resolution["errors"] = vis["errors"] + res["errors"]
             stage("resolve", t)
+        elif vis is not None and vis["candidates"]:
+            resolution = dict(ran=True, hits=vis["hits"], image_hits=[], geo=None,
+                              errors=vis["errors"], queries=vis["queries"],
+                              fingerprint=vis["fingerprint"], hypotheses=vis["hypotheses"])
 
     timings["total"] = round(time.time() - t0, 2)
 
@@ -411,3 +446,218 @@ def _detect_tutorial_signals(ocr_lines: list, frames: list, transcript: list) ->
                 return True
     
     return False
+
+def analyze_multi_post(
+    images: list[bytes],
+    job_id: str | None = None,
+    settings: Settings | None = None,
+) -> ReelResult:
+    """Analyze a multi-post carousel (series of images) directly - no frame extraction needed."""
+    if settings is None:
+        settings = Settings()
+
+    if job_id is None:
+        job_id = uuid.uuid4().hex[:12]
+
+    storage = get_phone_storage()
+    timings: dict[str, float] = {}
+    t0 = time.time()
+
+    # Save all images to phone storage and run OCR
+    all_ocr_lines = []
+    source_frames = []
+
+    for idx, img_bytes in enumerate(images):
+        t_img = time.time()
+        frame = storage.save_image(job_id, idx, img_bytes)
+        source_frames.append(frame)
+        timings[f"save_image_{idx}"] = time.time() - t_img
+
+        # OCR on each image using saved local path
+        t_ocr = time.time()
+        ocr_tuples = ocr.ocr_frame(frame.local_path)
+        # ocr_frame returns list of (text, conf) tuples
+        ocr_lines = [{"text": text, "conf": conf} for text, conf in ocr_tuples]
+        all_ocr_lines.extend(ocr_lines)
+        frame.ocr_text = "\n".join([l["text"] for l in ocr_lines]) if ocr_lines else None
+        timings[f"ocr_{idx}"] = time.time() - t_ocr
+
+    # Run extraction on combined OCR text using extract.gather and extract.merge
+    t_extract = time.time()
+    candidates = extract.merge(extract.gather([], all_ocr_lines, ""))
+    timings["extraction"] = time.time() - t_extract
+
+    # Verify candidates
+    t_verify = time.time()
+    verified = []
+    for c in candidates:
+        verify.verify(c, False)  # web=False for offline
+        if c.verification and c.verification.get("ok"):
+            verified.append(c)
+    timings["verification"] = time.time() - t_verify
+
+    # Reason if needed
+    summary = ""
+    t_reason = time.time()
+    if not verified and all_ocr_lines:
+        stg = settings.for_stage("TEXT")
+        try:
+            result = reason.reason([], all_ocr_lines, {}, candidates, stg)
+            if isinstance(result, tuple) and len(result) == 5:
+                sm, llm_c, u, cl, _tags = result
+            else:
+                sm, llm_c, u, cl = result
+                _tags = []
+            if sm:
+                summary = sm
+            if llm_c:
+                verified = llm_c
+        except Exception as e:
+            print(f"[llm] failed: {e}")
+    timings["reasoning"] = time.time() - t_reason
+
+    # Build summary using _fallback_summary
+    if not verified and not summary:
+        summary = _fallback_summary("", [], all_ocr_lines, candidates, None, verified)
+
+    timings["total"] = time.time() - t0
+
+    result = ReelResult(
+        job_id=job_id,
+        status="completed",
+        summary=summary,
+        candidates=verified,
+        timings=timings,
+        source_frames=source_frames,
+    )
+
+    storage.save_result(result)
+    return result
+
+
+def analyze_reel_with_storage(
+    video_path: Path,
+    job_id: str | None = None,
+    settings: Settings | None = None,
+    max_frames: int = 20,
+    fixed_hz: float | None = None,
+    max_side: int = 1280,
+) -> ReelResult:
+    """Analyze a reel video - extract frames, save to phone storage, then process."""
+    if settings is None:
+        settings = Settings()
+
+    if job_id is None:
+        job_id = uuid.uuid4().hex[:12]
+
+    storage = get_phone_storage()
+    timings: dict[str, float] = {}
+    t0 = time.time()
+
+# Extract frames from video using media.sample_frames
+    t_extract_frames = time.time()
+    import tempfile
+    import cv2
+    all_ocr_lines = []
+    source_frames = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        frame_infos = media.sample_frames(
+            video_path,
+            Path(tmpdir),
+            max_frames=max_frames,
+            fixed_hz=fixed_hz or 1.0,
+            max_side=max_side,
+        )
+
+        # Process frames while temp directory still exists
+        for idx, frame_info in enumerate(frame_infos):
+            timestamp = frame_info["t"]
+            frame_img = cv2.imread(frame_info["path"])
+            if frame_img is None:
+                continue
+            t_frame = time.time()
+            # Convert frame to bytes
+            _, buf = cv2.imencode(".jpg", frame_img)
+            frame_bytes = buf.tobytes()
+
+            frame = storage.save_frame(job_id, idx, timestamp, frame_bytes)
+            source_frames.append(frame)
+            timings[f"save_frame_{idx}"] = time.time() - t_frame
+
+            # OCR using saved local path
+            t_ocr = time.time()
+            ocr_tuples = ocr.ocr_frame(frame.local_path)
+            # ocr_frame returns list of (text, conf) tuples
+            ocr_lines = [{"text": text, "conf": conf} for text, conf in ocr_tuples]
+            all_ocr_lines.extend(ocr_lines)
+            frame.ocr_text = "\n".join([l["text"] for l in ocr_lines]) if ocr_lines else None
+            timings[f"ocr_{idx}"] = time.time() - t_ocr
+
+    timings["frame_extraction"] = time.time() - t_extract_frames
+
+    # Rest of pipeline (same as analyze)
+    t_asr = time.time()
+    audio_path = video_path.with_suffix(".wav")
+    transcript = []
+    if media.extract_audio(video_path, audio_path):
+        transcript = asr.transcribe(audio_path, settings.whisper_model)
+        try:
+            audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    timings["asr"] = time.time() - t_asr
+
+    # Extraction from OCR + transcript using extract.gather and extract.merge
+    t_extract = time.time()
+    candidates = extract.merge(extract.gather(transcript, all_ocr_lines, ""))
+    timings["extraction"] = time.time() - t_extract
+
+    # Verification
+    t_verify = time.time()
+    verified = []
+    for c in candidates:
+        verify.verify(c, False)  # web=False for offline
+        if c.verification and c.verification.get("ok"):
+            verified.append(c)
+    timings["verification"] = time.time() - t_verify
+
+    # Reasoning
+    summary = ""
+    t_reason = time.time()
+    if not verified and (all_ocr_lines or transcript):
+        stg = settings.for_stage("TEXT")
+        try:
+            result = reason.reason(
+                transcript, all_ocr_lines, {}, candidates, stg
+            )
+            if isinstance(result, tuple) and len(result) == 5:
+                sm, llm_c, u, cl, _tags = result
+            else:
+                sm, llm_c, u, cl = result
+                _tags = []
+            if sm:
+                summary = sm
+            if llm_c:
+                verified = llm_c
+        except Exception as e:
+            print(f"[llm] failed: {e}")
+    timings["reasoning"] = time.time() - t_reason
+
+    # Build summary using _fallback_summary
+    if not summary:
+        summary = _fallback_summary("", transcript, all_ocr_lines, candidates, None, verified)
+
+    timings["total"] = time.time() - t0
+
+    result = ReelResult(
+        job_id=job_id,
+        status="completed",
+        summary=summary,
+        candidates=verified,
+        timings=timings,
+        source_frames=source_frames,
+    )
+
+    storage.save_result(result)
+    return result
