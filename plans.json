@@ -5,11 +5,11 @@
     {
       "id": "free",
       "name": "Free",
-      "monthly_reels": 5,
+      "monthly_reels": 20,
       "price_usd_month": 0,
-      "tagline": "Try Kept with 5 reels every month",
+      "tagline": "Try Kept with 20 reels every month",
       "features": [
-        "5 reels or posts a month",
+        "20 reels or posts a month",
         "Key moments, places and links",
         "Everything stays on your phone"
       ],

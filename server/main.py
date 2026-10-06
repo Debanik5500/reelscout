@@ -547,6 +547,7 @@ async def get_storage_stats():
 
 class SubmitReelRequest(BaseModel):
     url: str
+    tz: str = "UTC"  # the user's IANA timezone, so dates found in the reel are read on their clock
 
 
 @app.get("/api/v1/plans")
@@ -570,9 +571,75 @@ async def submit_reel(request: SubmitReelRequest, x_device_id: Optional[str] = H
     if not is_supported_link(url):
         raise HTTPException(status_code=422, detail="Not a reel or post link from a supported site")
     try:
-        job = job_manager.submit(url, x_device_id)
+        job = job_manager.submit(url, x_device_id, request.tz)
     except quota.QuotaExceeded as exc:
         # 402: the app opens the plans page. Body carries the numbers it needs.
+        raise HTTPException(status_code=402, detail={"error": "quota_exceeded", **exc.status})
+    storage = get_phone_storage()
+    if job.get("existing"):
+        return {"id": job["id"], "existing": True, "reel": prepare_reel(job["id"], storage),
+                "quota": quota.status(x_device_id)}
+    return {"id": job["id"], "existing": False, "reel": prepare_live(job, storage), "quota": quota.status(x_device_id)}
+
+
+class SubmitWebRequest(BaseModel):
+    url: str = ""
+    text: str = ""
+    tz: str = "UTC"
+
+
+@app.post("/api/v1/web")
+async def submit_web(request: SubmitWebRequest, x_device_id: Optional[str] = Header(default=None)):
+    """A web page, a Google search link, or pasted text: read it and pull out events, places and key facts."""
+    from reelscout import webpage
+
+    url, text = request.url.strip(), request.text.strip()
+    if not url and not text:
+        raise HTTPException(status_code=422, detail="Send a link or some text")
+    if len(text) > webpage.MAX_TEXT:
+        raise HTTPException(status_code=413, detail="That text is too long")
+    if url:
+        if is_supported_link(url):
+            raise HTTPException(status_code=422, detail="That is a reel or post link; add it as a reel")
+        try:
+            await asyncio.to_thread(webpage.check_url, url)  # reject unsafe addresses before queueing anything
+        except webpage.UnsafeURL as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    try:
+        job = job_manager.submit_web(url, text if not url else "", request.tz, x_device_id)
+    except quota.QuotaExceeded as exc:
+        raise HTTPException(status_code=402, detail={"error": "quota_exceeded", **exc.status})
+    storage = get_phone_storage()
+    if job.get("existing"):
+        return {"id": job["id"], "existing": True, "reel": prepare_reel(job["id"], storage),
+                "quota": quota.status(x_device_id)}
+    return {"id": job["id"], "existing": False, "reel": prepare_live(job, storage), "quota": quota.status(x_device_id)}
+
+
+@app.post("/api/v1/screenshots")
+async def submit_screenshots(
+    files: list[UploadFile] = File(...),
+    tz: str = Form("UTC"),
+    x_device_id: Optional[str] = Header(default=None),
+):
+    """Upload 1-10 screenshots. They are read, classified, and any events in them are extracted for reminders."""
+    from reelscout import screenshots
+
+    if not 1 <= len(files) <= screenshots.MAX_IMAGES:
+        raise HTTPException(status_code=422, detail=f"Send between 1 and {screenshots.MAX_IMAGES} screenshots")
+    raw = []
+    for upload in files:
+        data = await upload.read(screenshots.MAX_IMAGE_BYTES + 1)
+        if len(data) > screenshots.MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="A screenshot is larger than 8 MB")
+        raw.append(data)
+    try:
+        images = await asyncio.to_thread(screenshots.normalize_images, raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    try:
+        job = job_manager.submit_screenshots(images, tz, x_device_id)
+    except quota.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail={"error": "quota_exceeded", **exc.status})
     storage = get_phone_storage()
     if job.get("existing"):

@@ -28,6 +28,10 @@ def friendly_error(exc: Exception) -> str:
         return "This reel or post is private, restricted or no longer available."
     if "429" in text or "rate" in text or "too many" in text:
         return "Instagram is limiting requests right now. Try again in a few minutes."
+    if "not public" in text or "only http" in text or "not allowed" in text or "could not be found" in text:
+        return "That link can't be read."
+    if "timed out" in text or "timeout" in text or "connection" in text:
+        return "The page didn't respond in time. Try again later."
     if "unsupported url" in text:
         return "That link isn't a reel or post."
     if "could not ingest" in text or "could not read" in text or "http error" in text:
@@ -69,7 +73,7 @@ class JobManager:
         return False
 
     # ── submit ───────────────────────────────────────────────────────────
-    def submit(self, url: str, device_id: str | None = None) -> dict:
+    def submit(self, url: str, device_id: str | None = None, tz: str = "UTC") -> dict:
         from reelscout import batch  # heavy imports (cv2, whisper) only when a job really starts
 
         from reelscout import context
@@ -89,10 +93,83 @@ class JobManager:
                        error="", created=time.time(), device=device_id)  # fresh dict: no stale failed_at
             self._jobs[job_id] = job
         self._emit(job)
-        self._pool.submit(self._run, job_id, url)
+        self._pool.submit(self._run, job_id, url, tz)
         return dict(job)
 
-    def _run(self, job_id: str, url: str) -> None:
+    def submit_screenshots(self, images: list[bytes], tz: str, device_id: str | None = None) -> dict:
+        """Queue screenshots (already normalised JPEGs). One submission counts as one item of the monthly limit."""
+        from reelscout import context, screenshots
+        from reelscout.storage import get_phone_storage
+
+        job_id = screenshots.job_id_for(images)
+        if context.load_context(get_phone_storage().results_dir, job_id) is not None:
+            return dict(id=job_id, url="", kind="screenshot", status="ready", progress=1.0, title="", chips=[],
+                        details={}, error="", created=time.time(), existing=True)
+        with self._lock:
+            existing = self._jobs.get(job_id)
+            if existing and existing["status"] in LIVE:
+                return dict(existing)
+            quota.reserve(device_id, job_id)
+            job = dict(id=job_id, url="", kind="screenshot", status="queued", progress=0.0, title="", chips=[],
+                       details={}, error="", created=time.time(), device=device_id)
+            self._jobs[job_id] = job
+        self._emit(job)
+        self._pool.submit(self._run_screenshots, job_id, images, tz)
+        return dict(job)
+
+    def submit_web(self, url: str, text: str, tz: str, device_id: str | None = None) -> dict:
+        """Queue a web page, a Google search link, or pasted text. One submission counts as one item."""
+        from reelscout import context, webpage
+        from reelscout.storage import get_phone_storage
+
+        job_id = webpage.job_id_for(url, text)
+        label = webpage.search_query(url) or ""
+        if context.load_context(get_phone_storage().results_dir, job_id) is not None:
+            return dict(id=job_id, url=url, kind="webpage", status="ready", progress=1.0, title="", chips=[],
+                        details={}, error="", created=time.time(), existing=True)
+        with self._lock:
+            existing = self._jobs.get(job_id)
+            if existing and existing["status"] in LIVE:
+                return dict(existing)
+            quota.reserve(device_id, job_id)
+            job = dict(id=job_id, url=url, kind="webpage", status="queued", progress=0.0, title=label, chips=[],
+                       details={}, error="", created=time.time(), device=device_id)
+            self._jobs[job_id] = job
+        self._emit(job)
+        self._pool.submit(self._run_web, job_id, url, text, tz)
+        return dict(job)
+
+    def _run_web(self, job_id: str, url: str, text: str, tz: str) -> None:
+        from reelscout import webpage
+        from reelscout.config import Settings
+
+        def on_progress(status: str, progress: float, detail: str = "", title: str = "", chips=None) -> None:
+            self._update(job_id, status=status, progress=progress, detail=(status, detail), title=title, chips=chips)
+
+        try:
+            webpage.process(url, text, tz, Settings.from_env(), on_progress, job_id=job_id)
+            self._update(job_id, status="ready", progress=1.0)
+        except Exception as exc:
+            logger.exception("web job %s failed", job_id)
+            quota.refund((self.get(job_id) or {}).get("device"), job_id)
+            self._update(job_id, status="failed", error=friendly_error(exc))
+
+    def _run_screenshots(self, job_id: str, images: list[bytes], tz: str) -> None:
+        from reelscout import screenshots
+        from reelscout.config import Settings
+
+        def on_progress(status: str, progress: float, detail: str = "", title: str = "", chips=None) -> None:
+            self._update(job_id, status=status, progress=progress, detail=(status, detail), title=title, chips=chips)
+
+        try:
+            screenshots.process(images, tz, Settings.from_env(), on_progress, job_id=job_id)
+            self._update(job_id, status="ready", progress=1.0)
+        except Exception as exc:
+            logger.exception("screenshot job %s failed", job_id)
+            quota.refund((self.get(job_id) or {}).get("device"), job_id)
+            self._update(job_id, status="failed", error=friendly_error(exc))
+
+    def _run(self, job_id: str, url: str, tz: str = "UTC") -> None:
         from reelscout import batch
         from reelscout.config import Settings
         from server.keymoments import _resolve_username
@@ -101,7 +178,7 @@ class JobManager:
             self._update(job_id, status=status, progress=progress, detail=(status, detail), title=title, chips=chips)
 
         try:
-            batch.process_reel(url, Settings.from_env(), resolve_username=_resolve_username, on_progress=on_progress)
+            batch.process_reel(url, Settings.from_env(), resolve_username=_resolve_username, on_progress=on_progress, tz=tz)
             self._update(job_id, status="ready", progress=1.0)
         except batch.DuplicateReel as dup:
             # Same reel under another link form: drop this job and tell the app which reel it really is.

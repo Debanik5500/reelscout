@@ -50,7 +50,7 @@ def test_unlimited_device_env(monkeypatch):
 def test_plans_file_has_a_free_plan():
     plans = quota.load_plans()
     free = next(p for p in plans["plans"] if p["id"] == plans["free_plan"])
-    assert free["monthly_reels"] == 5 and free["price_usd_month"] == 0
+    assert free["monthly_reels"] >= 1 and free["price_usd_month"] == 0  # the number itself is the owner's choice
 
 
 def test_failed_reel_errors_are_plain_language():

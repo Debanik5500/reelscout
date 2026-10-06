@@ -120,7 +120,7 @@ def _chips(ctx: dict) -> list[str]:
 
 
 def _finish(job_id: str, storage, st: Settings, analysis: dict, frame_paths: list[str], frame_label: str,
-            meta: dict, caption: str, progress: ProgressFn, resolve_username, extra: dict) -> str:
+            meta: dict, caption: str, progress: ProgressFn, resolve_username, extra: dict, tz: str = "UTC") -> str:
     """Shared tail for reels and image posts: observe the visuals, research + synthesize, save the context."""
     progress("keyMoments", 0.0)
     observe_usage: dict = {}
@@ -135,7 +135,7 @@ def _finish(job_id: str, storage, st: Settings, analysis: dict, frame_paths: lis
 
     progress("keyMoments", 1.0, detail=frame_label, title=_caption_hint(caption))
     progress("placesAndBoard", 0.0)
-    ctx, debug = context.synthesize(analysis, observations, st)
+    ctx, debug = context.synthesize(analysis, observations, st, tz=tz)
     # Every LLM call this reel cost, by stage, so cost_report.py can price it exactly.
     debug["usage"]["observe"] = observe_usage
     debug["vision"] = dict(used=looked, mode=_vision_mode(), signals=signals)
@@ -154,7 +154,7 @@ def _finish(job_id: str, storage, st: Settings, analysis: dict, frame_paths: lis
 
 
 def _process_post(source: str, images: list[bytes], meta: dict, job_id: str, st: Settings, storage,
-                  progress: ProgressFn, resolve_username) -> str:
+                  progress: ProgressFn, resolve_username, tz: str = "UTC") -> str:
     """Image post / carousel: every slide becomes a frame (OCR + vision); there is no audio to transcribe."""
     import cv2
     import numpy as np
@@ -198,11 +198,11 @@ def _process_post(source: str, images: list[bytes], meta: dict, job_id: str, st:
     extra = dict(kind="post", source_url=meta.get("webpage_url") or source, group=_top_group(analysis),
                  username=uploader if re.fullmatch(r"[A-Za-z0-9._]{2,30}", uploader) else "")
     return _finish(job_id, storage, st, analysis, paths, f"{len(frames)} slides", meta, caption, progress,
-                   resolve_username, extra)
+                   resolve_username, extra, tz)
 
 
 def process_reel(source: str, st: Settings | None = None, caption: str = "", force: bool = False,
-                 resolve_username=None, on_progress: ProgressFn | None = None) -> str:
+                 resolve_username=None, on_progress: ProgressFn | None = None, tz: str = "UTC") -> str:
     """Analyse one reel or image post (URL or local video). Returns the job id.
     Skips items already processed unless force."""
     progress = on_progress or (lambda *a, **k: None)
@@ -227,7 +227,7 @@ def process_reel(source: str, st: Settings | None = None, caption: str = "", for
         if post:
             images, meta = post
             return _process_post(source, images, {**meta, "caption": caption or meta["caption"]}, job_id, st,
-                                 storage, progress, resolve_username)
+                                 storage, progress, resolve_username, tz)
 
     video, meta = ingest.fetch(source, st.cache_dir / "downloads", cookies_file=cookies_file(), comments=False)
     caption = caption or meta.get("caption", "")
@@ -250,4 +250,4 @@ def process_reel(source: str, st: Settings | None = None, caption: str = "", for
     paths = [f.local_path for f in _evenly(stored.source_frames, _vision_frame_count(st)) if f.local_path]
     page = meta.get("webpage_url") or (source if source.startswith(("http://", "https://")) else "")
     return _finish(job_id, storage, st, analysis, paths, f"{len(stored.source_frames)} frames", meta, caption,
-                   progress, resolve_username, dict(kind="reel", source_url=page, group=_top_group(analysis)))
+                   progress, resolve_username, dict(kind="reel", source_url=page, group=_top_group(analysis)), tz)

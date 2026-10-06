@@ -160,7 +160,8 @@ def ollama_preflight(model: str, base_url: str) -> None:
     _ollama_checked.add((base_url, model))
 
 
-def _complete(system: str, user: str, settings: Settings, image_paths: list[str] | None = None) -> tuple[dict, dict]:
+def _complete(system: str, user: str, settings: Settings, image_paths: list[str] | None = None,
+              max_tokens: int | None = None) -> tuple[dict, dict]:
     p = settings.preset
     if not p:
         raise LLMError(f"unknown llm '{settings.llm}'")
@@ -181,7 +182,7 @@ def _complete(system: str, user: str, settings: Settings, image_paths: list[str]
         content.append({"type": "text", "text": user})
         url = p["base_url"] + "/v1/messages"
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-        body = {"model": model, "max_tokens": 1500, "temperature": 0, "system": system,
+        body = {"model": model, "max_tokens": max_tokens or 1500, "temperature": 0, "system": system,
                 "messages": [{"role": "user", "content": content}]}
     else:
         content = [{"type": "text", "text": user}] + [
@@ -192,10 +193,10 @@ def _complete(system: str, user: str, settings: Settings, image_paths: list[str]
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": content if images else user}]}
         if settings.llm == "openai" and not re.match(r"^gpt-4", model):
-            body["max_completion_tokens"] = 4000   # gpt-5.x / o-series reason silently and reject custom temperature
+            body["max_completion_tokens"] = max(max_tokens or 0, 4000)   # gpt-5.x / o-series reason silently and reject custom temperature
         else:
             body["temperature"] = 0
-            body["max_tokens"] = 1200
+            body["max_tokens"] = max_tokens or 1200
 
     last = None
     for attempt in range(5 + len(pool.keys)):  # free tiers rate-limit; back off, or move to the next key
@@ -247,17 +248,18 @@ def _complete(system: str, user: str, settings: Settings, image_paths: list[str]
 _blocked_until: dict[str, float] = {}  # provider -> time its quota resets, so we stop sending doomed requests
 
 
-def complete_json(system: str, user: str, settings: Settings, image_paths: list[str] | None = None) -> tuple[dict, dict]:
+def complete_json(system: str, user: str, settings: Settings, image_paths: list[str] | None = None,
+                  max_tokens: int | None = None) -> tuple[dict, dict]:
     """One JSON completion. If the provider's quota is exhausted, uses the fallback provider until it resets."""
     fallback = _fallback(settings)
     if fallback is not None and time.time() < _blocked_until.get(settings.llm, 0.0):
-        return _complete(system, user, fallback, image_paths)
+        return _complete(system, user, fallback, image_paths, max_tokens)
     try:
-        return _complete(system, user, settings, image_paths)
+        return _complete(system, user, settings, image_paths, max_tokens)
     except RateLimited as exc:
         if fallback is None:
             raise
         _blocked_until[settings.llm] = time.time() + min(exc.retry_after, 3600.0)
         logger.warning("%s is rate limited (retry in %.0fs); using %s:%s until it resets", settings.llm,
                        exc.retry_after, fallback.llm, fallback.model)
-        return _complete(system, user, fallback, image_paths)
+        return _complete(system, user, fallback, image_paths, max_tokens)

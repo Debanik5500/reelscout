@@ -544,9 +544,16 @@ def prepare_reel(job_id: str, storage) -> dict | None:
     ctx_summary = (ctx.get("summary") or summary)[:_MAX_SUMMARY]
     useful = ctx.get("useful_context") or []
 
+    kind = ctx.get("kind") or "reel"
+    is_screenshot = kind == "screenshot"
+    is_web = kind == "webpage"
+    is_post = kind == "post" or is_screenshot or is_web  # shown in order, with no scene picking (a page has none)
     video_id = _video_id(job_id)
     source_url = ctx.get("source_url") or meta.get("url") or f"https://www.instagram.com/reels/{video_id}/"
-    is_post = ctx.get("kind") == "post"
+    if is_screenshot:
+        source_url = ""
+    if is_web:
+        source_url = ctx.get("source_url") or ""
     timestamps = [f.get("timestamp") for f in frames if isinstance(f.get("timestamp"), (int, float))]
 
     payload = ReelPayload(
@@ -565,11 +572,14 @@ def prepare_reel(job_id: str, storage) -> dict | None:
         useful_context=useful,
         sources=ctx.get("sources") or [],
         username=ctx.get("username") or "",
-        author=_author(meta, ctx.get("username")),
+        author=(ctx.get("domain") or "") if is_web else "" if is_screenshot else _author(meta, ctx.get("username")),
         duration="0:00" if is_post or not timestamps else format_time(max(timestamps)),
         cover_url=f"/api/v1/storage/{job_id}/frames/0" if frames else "",
         group=ctx.get("group") or _top_kind(result),
-        platform=_platform(source_url),
+        platform="web" if is_web else "screenshot" if is_screenshot else _platform(source_url),
+        kind=kind,
+        shot_type=ctx.get("shot_type") or "",
+        events=ctx.get("events") or [],
         source_url=source_url,
         frame_count=len(frames),
         key_moments=_post_moments(job_id, storage) if is_post else select_key_moments(job_id, storage),
@@ -588,8 +598,9 @@ def prepare_live(job: dict, storage) -> dict:
         title=job.get("title") or "",
         status=job["status"],
         progress=float(job.get("progress") or 0.0),
+        kind=job.get("kind") or "reel",
         source_url=job["url"],
-        platform=_platform(job["url"]),
+        platform={"screenshot": "screenshot", "webpage": "web"}.get(job.get("kind") or "", None) or _platform(job["url"]),
         cover_url=f"/api/v1/storage/{job_id}/frames/0" if frames else "",
         frame_count=len(frames),
         details=job.get("details") or {},

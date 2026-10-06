@@ -50,6 +50,21 @@ class Source(BaseModel):
     url: str = ""
 
 
+class Event(BaseModel):
+    """A dated thing found in a screenshot (event, ticket, booking, deadline). Times are ISO 8601 with offset."""
+
+    id: str = ""
+    title: str = ""
+    start: str = ""
+    end: str = ""
+    all_day: bool = False
+    timezone: str = ""  # IANA name the times were read in
+    location: str = ""
+    notes: str = ""
+    confidence: float = 0.0
+    needs_check: bool = False  # date was inferred or the time is missing: ask the user to confirm
+
+
 class KeyMoment(BaseModel):
     id: str = ""
     timestamp: str = ""
@@ -87,6 +102,9 @@ class ReelPayload(ReelContext):
     """Full wire object returned by /api/v1/reels."""
 
     schema_version: int = CONTEXT_SCHEMA
+    kind: str = "reel"  # reel | post | screenshot
+    shot_type: str = ""  # screenshots only: event, ticket, booking, schedule, message, article, ...
+    events: list[Event] = Field(default_factory=list)
     id: str
     created: str | float | None = None
     author: str = ""

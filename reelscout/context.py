@@ -12,10 +12,12 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from . import research, verify
+from .events import EVENT_RULES, normalize_events, zone
 from .config import Settings
 from .llm import complete_json
 from .reason import select_ocr
@@ -32,7 +34,7 @@ Return JSON only, every list may be empty:
 {"text_visible": [str], "people": [str], "objects": [str], "architecture": [str], "signs": [str], "logos": [str], "landscape": [str], "screens_or_ui": [str], "food": [str], "distinctive_features": [str], "activities": [str], "other_clues": [str]}
 Short phrases only. Merge duplicates across frames."""
 
-FINAL_SYSTEM = """You create the useful context for one short social-media video (reel) that a user saved, for display in a mobile app.
+_FINAL_TEMPLATE = """You create the useful context for one short social-media video (reel) that a user saved, for display in a mobile app.
 You get: caption, transcript, on-screen text, neutral visual observations, entities found by local extraction, and VERIFIED research findings.
 Rules:
 - Fill a field ONLY when the evidence supports it. Empty is correct and preferred over a guess. Never invent.
@@ -43,6 +45,7 @@ Rules:
   - name = the MOST SPECIFIC place the evidence supports (the venue if a SUPPORTED finding or the reel names it, else the area narrowed by landmarks, e.g. "Old Manali" when the caption says it is near Manu Temple). Never use a coarser name than the evidence allows.
   - precision: "exact" only when the exact venue/address is verified; "area" for a neighbourhood, landmark or natural spot; "city" for city only.
   - note: when precision is not "exact", one short sentence on what is missing or how it was narrowed. Empty when exact.
+{event_rules}
 - products: physical/commercial things. links: websites, GitHub repos, tools, packages, apps (kind: github_repo|website|tool|package|app|other). people: named people with a role.
 - LISTS: when the reel presents a list of items (repos, tools, apps, places, products), include EVERY item (up to 12), not a sample. Give one `links` entry per item with label (the item's name), kind, note (what it does, max 90 chars, from the caption or slides) and url ONLY if the evidence shows it; leave url empty otherwise (it is looked up afterwards). Use a repo's own name as the label.
 - Never list the uploader's own brand, watermark, handle or call-to-action ("Save for later", "Comment X") as a link or product.
@@ -56,7 +59,11 @@ Return JSON only:
  "places": [{"name": str, "area": str, "city": str, "country": str, "confidence": number, "precision": "exact|area|city", "note": str}],
  "products": [{"name": str, "brand": str, "url": str}], "people": [{"name": str, "role": str}],
  "links": [{"label": str, "url": str, "kind": str, "note": str}], "things_mentioned": [str], "activities": [str],
+ "events": [{"title": str, "start": str, "end": str, "all_day": boolean, "tz": str, "year_inferred": boolean,
+             "location": str, "notes": str, "confidence": number}],
  "useful_context": [str], "username": str}"""
+
+FINAL_SYSTEM = _FINAL_TEMPLATE.replace("{event_rules}", EVENT_RULES.format(limit=5))
 
 
 def stage_label(st: Settings, vision: bool = False) -> str:
@@ -65,12 +72,12 @@ def stage_label(st: Settings, vision: bool = False) -> str:
     return f"{st.llm}:{model}"
 
 
-def observe(frame_paths: list[str], st: Settings) -> tuple[dict, dict]:
+def observe(frame_paths: list[str], st: Settings, system: str | None = None) -> tuple[dict, dict]:
     """One vision call over a handful of frames -> neutral observations."""
     if not frame_paths or st.llm == "none":
         return {}, {}
     st = st.for_stage("VISION")
-    data, usage = complete_json(OBSERVE_SYSTEM, "Frames are attached in chronological order.", st, frame_paths)
+    data, usage = complete_json(system or OBSERVE_SYSTEM, "Images are attached in order.", st, frame_paths)
     usage = {**usage, "model": stage_label(st, vision=True), "images": len(frame_paths)}
     return {k: [str(x) for x in v if str(x).strip()] for k, v in data.items() if isinstance(v, list) and v}, usage
 
@@ -96,11 +103,13 @@ def evidence_ocr(ocr_lines: list[dict], limit: int = 60) -> list[str]:
     return merged[:limit]
 
 
-def build_evidence(analysis: dict, observations: dict) -> str:
+def build_evidence(analysis: dict, observations: dict, now: datetime | None = None, tz: str = "UTC") -> str:
     meta = analysis.get("meta") or {}
     cands = analysis.get("candidates") or []
     ocr = analysis.get("ocr_lines") or []
+    stamp = (now or datetime.now(timezone.utc)).strftime("%A %Y-%m-%d %H:%M")
     lines = [
+        f"CURRENT DATE AND TIME: {stamp} (user timezone: {tz})",
         f"CAPTION: {(analysis.get('caption') or '(none)')[:1500]}",
         f"UPLOADER: {meta.get('uploader')} | LOCATION TAG: {meta.get('location')} | HASHTAGS: {meta.get('hashtags')} | MENTIONS/TAGGED: {meta.get('mentions')} {meta.get('tagged')}",
         f"TRANSCRIPT: {(analysis.get('transcript_text') or '(no speech)')[:3000]}",
@@ -398,17 +407,20 @@ def _finalize(data: dict, findings: list[dict], sources: list[dict], category_hi
     )
 
 
-def synthesize(analysis: dict, observations: dict, st: Settings, max_rounds: int = 3) -> tuple[dict, dict]:
+def synthesize(analysis: dict, observations: dict, st: Settings, max_rounds: int = 3,
+               tz: str = "UTC") -> tuple[dict, dict]:
     """Research + final LLM. Returns (context dict, debug dict). Raises if the final LLM fails."""
-    evidence = build_evidence(analysis, observations)
+    now = datetime.now(zone(tz) or timezone.utc)
+    evidence = build_evidence(analysis, observations, now, tz)
     res = research.research(evidence, st, max_rounds)
     verified = "\n".join(
         f"- [{f['verdict']} {f['confidence']:.2f}] {f['goal']} -> {f['candidate']} ({f['kind']}) "
         f"city={f['city']} country={f['country']} url={f['url']} support={f['evidence']} contradictions={f['contradictions']}"
         for f in res["findings"]) or "(no research was needed or nothing verified)"
     stg = st.for_stage("TEXT")
-    data, usage = complete_json(FINAL_SYSTEM, f"{evidence}\n\nRESEARCH FINDINGS:\n{verified}", stg)
+    data, usage = complete_json(FINAL_SYSTEM, f"{evidence}\n\nRESEARCH FINDINGS:\n{verified}", stg, max_tokens=2200)
     ctx = _finalize(data, res["findings"], res["sources"], category_hint="")
+    ctx["events"] = normalize_events(data.get("events"), now, tz, limit=5)
     _ground_location(ctx)
     resolve_usage = _resolve_list_links(ctx, st)
     # Describe EVERY listed item first; only then drop links that could not be verified. A repo whose URL is
