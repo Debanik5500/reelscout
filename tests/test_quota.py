@@ -51,3 +51,12 @@ def test_plans_file_has_a_free_plan():
     plans = quota.load_plans()
     free = next(p for p in plans["plans"] if p["id"] == plans["free_plan"])
     assert free["monthly_reels"] == 5 and free["price_usd_month"] == 0
+
+
+def test_failed_reel_errors_are_plain_language():
+    from server.jobs import friendly_error
+    assert "private" in friendly_error(RuntimeError("Fetching Post metadata failed."))
+    assert "private" in friendly_error(RuntimeError("Instagram sent an empty media response"))
+    assert "limiting" in friendly_error(RuntimeError("HTTP Error 429: Too Many Requests"))
+    assert "isn't a reel" in friendly_error(RuntimeError("Unsupported URL: https://x"))
+    assert "went wrong" in friendly_error(RuntimeError("segfault in thingamajig"))

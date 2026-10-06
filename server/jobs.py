@@ -20,6 +20,21 @@ FAILED_TTL = 3 * 60  # seconds after the failure; the app removes failed cards a
 LIVE = ("queued", "downloading", "watching", "keyMoments", "placesAndBoard")
 
 
+def friendly_error(exc: Exception) -> str:
+    """Plain-language reason for the failed card. The raw error stays in the server log."""
+    text = str(exc).lower()
+    if any(k in text for k in ("empty media response", "metadata failed", "private", "login required",
+                               "not available", "unavailable", "restricted")):
+        return "This reel or post is private, restricted or no longer available."
+    if "429" in text or "rate" in text or "too many" in text:
+        return "Instagram is limiting requests right now. Try again in a few minutes."
+    if "unsupported url" in text:
+        return "That link isn't a reel or post."
+    if "could not ingest" in text or "could not read" in text or "http error" in text:
+        return "Couldn't download this reel. Instagram may be blocking the request. Try again later."
+    return "Something went wrong while reading this reel."
+
+
 class JobManager:
     def __init__(self, workers: int | None = None):
         self._pool = ThreadPoolExecutor(max_workers=workers or int(os.getenv("REELSCOUT_JOB_WORKERS", "2")))
@@ -97,7 +112,7 @@ class JobManager:
         except Exception as exc:
             logger.exception("job %s failed", job_id)
             quota.refund((self.get(job_id) or {}).get("device"), job_id)  # a failed reel is not charged
-            self._update(job_id, status="failed", error=str(exc)[:200])
+            self._update(job_id, status="failed", error=friendly_error(exc))
 
     def _update(self, job_id: str, status: str, progress: float | None = None, detail=None,
                 title: str = "", chips=None, error: str = "") -> None:
