@@ -15,27 +15,24 @@ import cv2
 import numpy as np
 import requests
 
-from reelscout import llm
-from reelscout.config import Settings
+from reelscout import context as reel_context
+from server.schema import ReelPayload
+
 
 logger = logging.getLogger("reelscout.keymoments")
 
 TEST_REELS_METADATA = Path("/Users/debanikdebnath/work/reelscout/test_reels/metadata.json")
 
 _FRAME_SIZE = (64, 64)
-_MAX_MOMENTS = 5
+_MAX_MOMENTS = 8
 _MIN_INDEX_GAP = 2
-_MIN_SECONDS_GAP = 3.0
-_BLUR_PERCENTILE = 25.0
+_MIN_SECONDS_GAP = 2.0
+_BLUR_PERCENTILE = 15.0
 _MAX_LABEL = 40
-_MAX_GIST = 500
 _MAX_SUMMARY = 200
-_MAX_PLACES = 5
-_MAX_POINTS = 3
+_MAX_POINTS = 12
+_MAX_SLIDES = 10
 
-_PREPARED_SCHEMA = 1
-_CATEGORIES = ("Food", "Travel", "Fitness", "Home")
-_NON_LOCATION_KINDS = ("github_repo", "tool", "website")
 _IG_HANDLE_RE = re.compile(r"^[A-Za-z0-9._]{2,30}$")
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -46,27 +43,6 @@ _BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
-_PREPARED_SYSTEM = (
-    "You prepare metadata for one Instagram reel shown in an iOS app.\n"
-    "Reply with ONLY one JSON object, no prose, with exactly these keys:\n"
-    '{"title": string, "category": string, "has_location": boolean, '
-    '"place": {"name": string, "subtitle": string} or null, "username": string or null}\n'
-    "Rules:\n"
-    '- title: at most 8 words, plain words only - no emoji, no hashtag, no URL, no quotes, '
-    'no "comment ..." call to action. Say what the reel is about, e.g. '
-    '"Claude Unlimited session keeper" or "AI YouTube faceless channel builder".\n'
-    '- category: exactly one of "Food", "Travel", "Fitness", "Home", or "" when none fits. '
-    'Tech, GitHub, tool, app, website and product reels use "".\n'
-    "- has_location: true only when the reel is about a physical place "
-    "(travel vlog, city, restaurant, stay, workation). When the top candidate is a "
-    "github repo, a tool, a website or other tech/product content, has_location is false.\n"
-    '- place: when has_location is true, {"name": "City, Country", '
-    '"subtitle": "Travel spot \u00b7 from this reel"} for a place the reel is really about; '
-    "otherwise null.\n"
-    "- username: null unless the caption clearly shows an Instagram handle starting with @. "
-    "Never invent one."
-)
-
 _PLATFORM_BY_HOST = {
     "instagram.com": "instagram",
     "instagr.am": "instagram",
@@ -162,12 +138,40 @@ def _frame_metrics(frames: list[dict]) -> tuple[np.ndarray, np.ndarray, list[int
     return diffs, sharp, loaded
 
 
-def _candidates(diffs, sharp, loaded: list[int]) -> list[tuple[int, float, str]]:
+# Two frames are "the same picture" when both the pixels and the colours barely differ. Measured: a locked-off
+# 13-frame shot differs by at most 1.1% (colour correlation >= 0.996); real scene changes differ far more.
+_SAME_PIXEL_DIFF = 0.045
+_SAME_HIST_CORR = 0.985
+
+
+def _signatures(frames: list[dict]) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """Tiny grayscale thumbnail plus a colour histogram for every frame that can be read."""
+    out: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for pos, frame in enumerate(frames):
+        path = frame.get("localPath") or frame.get("local_path")
+        image = cv2.imread(str(path)) if path else None
+        if image is None:
+            continue
+        gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), _FRAME_SIZE, interpolation=cv2.INTER_AREA)
+        hist = cv2.calcHist([image], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
+        out[pos] = (gray.astype(np.float32), cv2.normalize(hist, hist).flatten())
+    return out
+
+
+def _same_picture(sigs: dict[int, tuple[np.ndarray, np.ndarray]], a: int, b: int) -> bool:
+    if a not in sigs or b not in sigs:
+        return False
+    pixel = float(np.mean(np.abs(sigs[a][0] - sigs[b][0])) / 255.0)
+    colour = float(cv2.compareHist(sigs[a][1], sigs[b][1], cv2.HISTCMP_CORREL))
+    return pixel < _SAME_PIXEL_DIFF and colour > _SAME_HIST_CORR
+
+
+def _moment_candidates(diffs, sharp, loaded: list[int]) -> list[tuple[int, float, str]]:
     if not loaded:
         return []
     sharp_values = sharp[loaded]
     nonzero = diffs[diffs > 0]
-    diff_threshold = float(np.median(nonzero)) if nonzero.size else 0.0
+    diff_threshold = float(np.percentile(nonzero, 35)) if nonzero.size else 0.0
     blur_threshold = float(np.percentile(sharp_values, _BLUR_PERCENTILE))
     sharp_median = float(np.median(sharp_values))
     out: list[tuple[int, float, str]] = []
@@ -185,7 +189,7 @@ def _candidates(diffs, sharp, loaded: list[int]) -> list[tuple[int, float, str]]
 
 
 def _pick_moments(
-    frames: list[dict], candidates: list[tuple[int, float, str]]
+    frames: list[dict], candidates: list[tuple[int, float, str]], same_picture=None
 ) -> tuple[list[int], dict[int, str]]:
     def seconds(pos: int) -> float:
         return float(frames[pos].get("timestamp") or 0.0)
@@ -202,6 +206,8 @@ def _pick_moments(
                 return False
             if abs(seconds(pos) - seconds(other)) < _MIN_SECONDS_GAP:
                 return False
+            if same_picture is not None and same_picture(pos, other):
+                return False  # a static shot must not fill the stack with copies of one frame
         return True
 
     ordered = sorted(candidates, key=lambda c: (0 if c[0] == 0 else 1, -c[1], c[0]))
@@ -246,7 +252,8 @@ def _label(ocr: str | None, seconds: float) -> str:
 
 def select_key_moments(job_id: str, storage) -> list[dict]:
     """Frames worth capturing, sorted by timestamp. Cached per job."""
-    cache_path = Path(storage.results_dir) / f"{job_id}.keymoments.json"
+    # Cap and spacing are part of the file name, so changing either never serves stale picks.
+    cache_path = Path(storage.results_dir) / f"{job_id}.keymoments{_MAX_MOMENTS}-{int(_MIN_SECONDS_GAP * 10)}-{int(_BLUR_PERCENTILE)}-d.json"
     if cache_path.is_file():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -262,7 +269,9 @@ def select_key_moments(job_id: str, storage) -> list[dict]:
     if frames:
         ocr = _ocr_map(job_id, storage)
         diffs, sharp, loaded = _frame_metrics(frames)
-        chosen, notes = _pick_moments(frames, _candidates(diffs, sharp, loaded))
+        sigs = _signatures(frames)
+        chosen, notes = _pick_moments(frames, _moment_candidates(diffs, sharp, loaded),
+                                      same_picture=lambda a, b: _same_picture(sigs, a, b))
         for pos in chosen:
             frame = frames[pos]
             frame_index = int(frame.get("index", pos))
@@ -284,6 +293,46 @@ def select_key_moments(job_id: str, storage) -> list[dict]:
     except OSError:
         logger.warning("could not cache key moments for %s", job_id)
     return moments
+
+
+def _post_moments(job_id: str, storage) -> list[dict]:
+    """Image post: every slide is a key moment, in order (no scene picking, no timestamps)."""
+    frames = (storage.metadata.get(job_id) or {}).get("frames") or []
+    ocr = _ocr_map(job_id, storage)
+    total = len(frames)
+    moments = []
+    for pos, frame in enumerate(frames[:_MAX_SLIDES]):
+        index = int(frame.get("index", pos))
+        text = ocr.get(index) or ""
+        label = next((line.strip()[:_MAX_LABEL] for line in text.splitlines()
+                      if sum(ch.isalnum() for ch in line) >= 3), f"Slide {pos + 1}")
+        moments.append({
+            "id": hashlib.sha1(f"{job_id}{index}".encode("utf-8")).hexdigest()[:16],
+            "index": index,
+            "timestamp": f"{pos + 1}/{total}",
+            "seconds": float(pos),
+            "label": label,
+            "note": "",
+            "frame_url": f"/api/v1/storage/{job_id}/frames/{index}",
+        })
+    return moments
+
+
+_IG_PATH = re.compile(r"^/(?:reels?|p|tv|share(?:/(?:reel|p))?)/[A-Za-z0-9_-]+")
+
+
+def is_supported_link(url: str) -> bool:
+    """True only for a link to one reel/post on a supported site. Search pages, home pages and GitHub are not."""
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    site = next((d for d in _PLATFORM_BY_HOST if d != "github.com" and (host == d or host.endswith("." + d))), None)
+    if site is None:
+        return False
+    if site in ("instagram.com", "instagr.am"):
+        return bool(_IG_PATH.match(parsed.path))  # the bare home page has no reel in it
+    return len(parsed.path.strip("/")) > 0
 
 
 def _platform(source_url: str) -> str:
@@ -371,21 +420,6 @@ def _ig_handle(value) -> str | None:
     return text
 
 
-def _llm_handle(value) -> str | None:
-    """Sanitise a handle proposed by the model."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if "instagram.com/" in text:
-        if not text.startswith("http"):
-            text = "https://" + text
-        return _ig_handle(text)
-    text = text.lstrip("@").strip().rstrip("/")
-    if not _IG_HANDLE_RE.match(text) or text.replace(".", "").isdigit():
-        return None
-    return text
-
-
 def _resolve_username(job_id: str) -> str | None:
     """Best-effort IG handle for the uploader. Two timeboxed attempts."""
     video_id = _video_id(job_id)
@@ -425,88 +459,6 @@ def _resolve_username(job_id: str) -> str | None:
     return None
 
 
-def _text_settings() -> Settings:
-    settings = Settings.from_env().for_stage("text")
-    if not settings.api_key:
-        settings = Settings(llm="groq")
-    return settings
-
-
-def _normalize_prepared(data) -> dict:
-    data = data if isinstance(data, dict) else {}
-    raw_category = str(data.get("category") or "").strip()
-    place = data.get("place") if isinstance(data.get("place"), dict) else None
-    name = _clean_line(str(place.get("name") or ""), 60) if place else ""
-    subtitle = _clean_line(str(place.get("subtitle") or ""), 60) if place else ""
-    has_location = bool(data.get("has_location")) and bool(name)
-    if has_location and not subtitle:
-        subtitle = "Travel spot \u00b7 from this reel"
-    return {
-        "title": _clean_title(str(data.get("title") or "")),
-        "category": raw_category if raw_category in _CATEGORIES else "",
-        "has_location": has_location,
-        "place": {"name": name, "subtitle": subtitle} if has_location else None,
-        "username": _llm_handle(data.get("username")),
-    }
-
-
-def _llm_prepare(caption: str, summary: str, result) -> dict | None:
-    """One LLM call per reel. None when the model fails (caller falls back)."""
-    bits: list[str] = []
-    for candidate in _candidates(result)[:5]:
-        kind = _cand_value(candidate, "kind") or ""
-        name = _cand_value(candidate, "name") or ""
-        url = _cand_value(candidate, "url") or ""
-        if kind or name:
-            bits.append(f"{kind} {name} {url}".strip())
-    user = (
-        "top candidates: " + ("; ".join(bits) if bits else "none") + "\n"
-        "summary: " + (summary or "none")[:400] + "\n"
-        "caption:\n" + (caption or "none")[:3000]
-    )
-    try:
-        data, _usage = llm.complete_json(_PREPARED_SYSTEM, user, _text_settings())
-    except Exception as exc:
-        logger.warning("reel prepare LLM failed, using fallback: %s", exc)
-        return None
-    return _normalize_prepared(data)
-
-
-def _prepared_path(job_id: str, storage) -> Path:
-    return Path(storage.results_dir) / f"{job_id}.prepared.json"
-
-
-def _load_prepared(job_id: str, storage) -> dict | None:
-    """Sidecar cache: schema:1 means reuse without touching the LLM."""
-    path = _prepared_path(job_id, storage)
-    try:
-        if not path.is_file():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or data.get("schema") != _PREPARED_SCHEMA:
-        return None
-    if data.get("source") == "fallback":
-        try:
-            if time.time() - float(data.get("_ts") or 0.0) > 300.0:
-                return None
-        except (TypeError, ValueError):
-            return None
-    return data
-
-
-def _save_prepared(job_id: str, storage, payload: dict) -> None:
-    path = _prepared_path(job_id, storage)
-    tmp = path.parent / (path.name + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        logger.warning("could not cache prepared reel for %s", job_id)
-
-
 def _top_kind(result) -> str:
     candidates = _candidates(result)
     if candidates:
@@ -516,30 +468,6 @@ def _top_kind(result) -> str:
     return "other"
 
 
-def _prepared(job_id: str, storage, caption: str, summary: str, result) -> dict:
-    cached = _load_prepared(job_id, storage)
-    if cached is not None:
-        return cached
-    username = _resolve_username(job_id)
-    prepared = _llm_prepare(caption, summary, result)
-    source = "llm" if prepared is not None else "fallback"
-    if prepared is None:
-        prepared = {
-            "title": "",
-            "category": "",
-            "has_location": False,
-            "place": None,
-            "username": None,
-        }
-    prepared["username"] = username or prepared.get("username")
-    prepared["source"] = source
-    prepared["group"] = _top_kind(result)
-    prepared["schema"] = _PREPARED_SCHEMA
-    prepared["_ts"] = time.time()
-    _save_prepared(job_id, storage, prepared)
-    return prepared
-
-
 def _author(meta: dict, username: str | None) -> str:
     if username:
         return "@" + username
@@ -547,41 +475,6 @@ def _author(meta: dict, username: str | None) -> str:
     if uploader and not uploader.replace(".", "").isdigit():
         return "@" + uploader
     return "Instagram User"
-
-
-def _legacy_places(result) -> list[dict]:
-    places: list[dict] = []
-    for candidate in _candidates(result)[:_MAX_PLACES]:
-        kind = str(_cand_value(candidate, "kind") or "other").lower()
-        if kind in _NON_LOCATION_KINDS:
-            continue
-        name = _cand_value(candidate, "name")
-        if not name:
-            continue
-        confidence = _cand_value(candidate, "confidence")
-        subtitle = f"{kind} \u00b7 {int(round(float(confidence) * 100))}%" if confidence else kind
-        places.append({
-            "name": str(name),
-            "subtitle": subtitle,
-            "map_url": _cand_value(candidate, "url")
-            or "https://maps.google.com/?q=" + quote(str(name)),
-        })
-    return places
-
-
-def _places_from(prepared: dict, result) -> list[dict]:
-    if prepared.get("has_location") and isinstance(prepared.get("place"), dict):
-        name = str(prepared["place"].get("name") or "").strip()
-        if not name:
-            return []
-        return [{
-            "name": name,
-            "subtitle": str(prepared["place"].get("subtitle") or "Travel spot \u00b7 from this reel"),
-            "map_url": "https://maps.google.com/?q=" + quote(name),
-        }]
-    if prepared.get("source") == "fallback":
-        return _legacy_places(result)
-    return []
 
 
 def _web_image_moments(job_id: str, have: int) -> list[dict]:
@@ -640,57 +533,66 @@ def prepare_reel(job_id: str, storage) -> dict | None:
         return None
 
     frames = job_meta.get("frames") or []
-    source = _find_source_meta(job_id)
-    meta = source.get("meta") or {}
+    meta = _find_source_meta(job_id).get("meta") or {}
     caption = (meta.get("caption") or "").strip()
     summary = (getattr(result, "summary", "") or "").strip()
 
-    prepared = _prepared(job_id, storage, caption, summary, result)
-    username = prepared.get("username")
-    author = _author(meta, username)
-    title = (
-        _clean_title(prepared.get("title") or _first_line(caption) or _first_sentence(summary))
-        or "Reel"
-    )
-    category = prepared.get("category") if prepared.get("category") in _CATEGORIES else ""
-    group = prepared.get("group") or _top_kind(result)
-    gist = summary
-    if caption:
-        gist = f"{summary}\n\n{caption}" if summary else caption
-    gist = gist[:_MAX_GIST]
+    # LLM-decided part. Missing sidecar -> empty context, never a guess from raw candidates.
+    ctx = reel_context.load_context(storage.results_dir, job_id) or {}
+    reel_context.fill_item_lines(ctx)  # older saved reels gain a line per described item too
+    title = _clean_title(ctx.get("title") or _first_line(caption) or _first_sentence(summary)) or "Reel"
+    ctx_summary = (ctx.get("summary") or summary)[:_MAX_SUMMARY]
+    useful = ctx.get("useful_context") or []
 
     video_id = _video_id(job_id)
-    source_url = meta.get("url") or f"https://www.instagram.com/reels/{video_id}/"
-    cover_url = f"/api/v1/storage/{job_id}/frames/0" if frames else None
-
+    source_url = ctx.get("source_url") or meta.get("url") or f"https://www.instagram.com/reels/{video_id}/"
+    is_post = ctx.get("kind") == "post"
     timestamps = [f.get("timestamp") for f in frames if isinstance(f.get("timestamp"), (int, float))]
-    duration = format_time(max(timestamps)) if timestamps else "0:00"
 
-    candidates = list(getattr(result, "candidates", None) or [])
-    places = _places_from(prepared, result)
-    points = [
-        {"text": f"Verify {_cand_value(c, 'name') or ''}", "done": False}
-        for c in candidates[:_MAX_POINTS]
-    ]
+    payload = ReelPayload(
+        id=job_id,
+        created=job_meta.get("created"),
+        title=title,
+        summary=ctx_summary,
+        category=ctx.get("category") or "",
+        location=ctx.get("location") or {},
+        places=ctx.get("places") or ([ctx["location"]] if (ctx.get("location") or {}).get("name") else []),
+        products=ctx.get("products") or [],
+        people=ctx.get("people") or [],
+        links=ctx.get("links") or [],
+        things_mentioned=ctx.get("things_mentioned") or [],
+        activities=ctx.get("activities") or [],
+        useful_context=useful,
+        sources=ctx.get("sources") or [],
+        username=ctx.get("username") or "",
+        author=_author(meta, ctx.get("username")),
+        duration="0:00" if is_post or not timestamps else format_time(max(timestamps)),
+        cover_url=f"/api/v1/storage/{job_id}/frames/0" if frames else "",
+        group=ctx.get("group") or _top_kind(result),
+        platform=_platform(source_url),
+        source_url=source_url,
+        frame_count=len(frames),
+        key_moments=_post_moments(job_id, storage) if is_post else select_key_moments(job_id, storage),
+        points=[{"text": t} for t in useful[:_MAX_POINTS]],
+    )
+    return payload.model_dump()
 
-    return {
-        "id": job_id,
-        "created": job_meta.get("created"),
-        "title": title,
-        "gist": gist,
-        "author": author,
-        "duration": duration,
-        "cover_url": cover_url,
-        "status": "ready",
-        "progress": 1.0,
-        "category": category,
-        "group": group,
-        "platform": _platform(source_url),
-        "source_url": source_url,
-        "summary": summary[:_MAX_SUMMARY],
-        "frame_count": len(frames),
-        "key_moments": select_key_moments(job_id, storage),
-        "places": places,
-        "points": points,
-        "board": None,
-    }
+
+def prepare_live(job: dict, storage) -> dict:
+    """Payload for a reel still being processed (or failed). Cover appears as soon as frames are saved."""
+    job_id = job["id"]
+    frames = (storage.metadata.get(job_id) or {}).get("frames") or []
+    return ReelPayload(
+        id=job_id,
+        created=time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(job["created"])),
+        title=job.get("title") or "",
+        status=job["status"],
+        progress=float(job.get("progress") or 0.0),
+        source_url=job["url"],
+        platform=_platform(job["url"]),
+        cover_url=f"/api/v1/storage/{job_id}/frames/0" if frames else "",
+        frame_count=len(frames),
+        details=job.get("details") or {},
+        chips=job.get("chips") or [],
+        error=job.get("error") or "",
+    ).model_dump()

@@ -14,17 +14,21 @@ _DEFAULT_MODEL = None
 _warmup_done = False
 
 
+_MODEL_LOCK = threading.Lock()
+
+
 def _get_model(model_size: str = "tiny"):
     from faster_whisper import WhisperModel
-    if model_size not in _MODELS:
-        _MODELS[model_size] = WhisperModel(
-            model_size,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=4,
-            num_workers=2
-        )
-    return _MODELS[model_size]
+    with _MODEL_LOCK:  # two reels starting together must not both load the model
+        if model_size not in _MODELS:
+            _MODELS[model_size] = WhisperModel(
+                model_size,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=4,
+                num_workers=2
+            )
+        return _MODELS[model_size]
 
 
 def transcribe(wav_path: str, model_size: str = "tiny") -> list[dict]:

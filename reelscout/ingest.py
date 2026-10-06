@@ -18,11 +18,14 @@ from pathlib import Path
 
 
 def empty_meta() -> dict:
-    return dict(caption="", uploader=None, hashtags=[], mentions=[], tagged=[], location=None, comments=[])
+    return dict(caption="", uploader=None, hashtags=[], mentions=[], tagged=[], location=None, comments=[],
+                id=None, webpage_url=None)
 
 
 def _from_ytdlp(info: dict) -> dict:
     m = empty_meta()
+    m["id"] = info.get("id")
+    m["webpage_url"] = info.get("webpage_url")
     m["caption"] = "\n".join(filter(None, [info.get("description"), info.get("title")]))
     uploader_id = info.get("uploader_id") or info.get("uploader") or info.get("channel")
     m["uploader"] = uploader_id
@@ -39,7 +42,8 @@ def _from_ytdlp(info: dict) -> dict:
     return m
 
 
-def _fetch_ytdlp(url: str, workdir: Path, cookies: str | None, cookies_file: str | None = None) -> tuple[Path, dict]:
+def _fetch_ytdlp(url: str, workdir: Path, cookies: str | None, cookies_file: str | None = None,
+                 comments: bool = True) -> tuple[Path, dict]:
     import yt_dlp
     base = {"quiet": True, "no_warnings": True, "format": "best[height<=720]/best",
             "outtmpl": str(workdir / "%(id)s.%(ext)s")}
@@ -47,8 +51,8 @@ def _fetch_ytdlp(url: str, workdir: Path, cookies: str | None, cookies_file: str
         base["cookiefile"] = cookies_file
     elif cookies:
         base["cookiesfrombrowser"] = (cookies,)
-    try:                                   # ask for comments first, retry without if the extractor balks
-        opts = dict(base, getcomments=True)
+    try:                                   # ask for comments first (if wanted), retry without if the extractor balks
+        opts = dict(base, getcomments=True) if comments else base
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             # Handle carousel posts (multiple entries)
@@ -70,7 +74,7 @@ def _fetch_ytdlp(url: str, workdir: Path, cookies: str | None, cookies_file: str
             return Path(ydl.prepare_filename(info)), _from_ytdlp(info)
 
 
-def _fetch_instaloader(url: str, workdir: Path) -> tuple[Path, dict]:
+def _fetch_instaloader(url: str, workdir: Path, comments: bool = True) -> tuple[Path, dict]:
     import instaloader, requests
     code = re.search(r"/(?:reel|reels|p|tv)/([\w-]+)", url).group(1)
     L = instaloader.Instaloader(download_videos=False, save_metadata=False, quiet=True)
@@ -80,7 +84,7 @@ def _fetch_instaloader(url: str, workdir: Path) -> tuple[Path, dict]:
              mentions=list(post.caption_mentions), tagged=list(post.tagged_users),
              location=getattr(post.location, "name", None) if post.location else None)
     try:                                   # comments need a logged-in session; skip quietly if not
-        for c in list(post.get_comments())[:60]:
+        for c in (list(post.get_comments())[:60] if comments else []):
             m["comments"].append(dict(author=c.owner.username, text=c.text, likes=c.likes_count,
                                       by_creator=c.owner.username == post.owner_username))
     except Exception:
@@ -90,19 +94,50 @@ def _fetch_instaloader(url: str, workdir: Path) -> tuple[Path, dict]:
     return path, m
 
 
-def fetch(source: str, workdir: Path, cookies_from_browser: str | None = None, cookies_file: str | None = None) -> tuple[Path, dict]:
+def fetch_post(url: str) -> tuple[list[bytes], dict] | None:
+    """Image post / carousel -> (slide images as bytes, metadata). None when the post is a video (use `fetch`).
+
+    yt-dlp cannot read image posts, so this goes through instaloader, which works for public posts without login.
+    """
+    import instaloader, requests
+    match = re.search(r"/(?:p|reel|reels|tv)/([\w-]+)", url)
+    if not match:
+        return None
+    code = match.group(1)
+    L = instaloader.Instaloader(download_videos=False, download_pictures=False, save_metadata=False, quiet=True)
+    post = instaloader.Post.from_shortcode(L.context, code)
+    if post.typename == "GraphVideo":
+        return None
+    nodes = list(post.get_sidecar_nodes()) if post.typename == "GraphSidecar" else []
+    urls = [n.display_url for n in nodes] or [post.url]
+    images: list[bytes] = []
+    for u in urls[:10]:
+        resp = requests.get(u, timeout=60)
+        resp.raise_for_status()
+        images.append(resp.content)
+    m = empty_meta()
+    m.update(caption=post.caption or "", uploader=post.owner_username, hashtags=list(post.caption_hashtags),
+             mentions=list(post.caption_mentions), tagged=list(post.tagged_users),
+             location=getattr(post.location, "name", None) if post.location else None,
+             id=code, webpage_url=f"https://www.instagram.com/p/{code}/")
+    return images, m
+
+
+def fetch(source: str, workdir: Path, cookies_from_browser: str | None = None, cookies_file: str | None = None,
+          comments: bool = True) -> tuple[Path, dict]:
+    """comments=False skips every comments request (fewer Instagram calls); tags and location are still read."""
     if not source.startswith(("http://", "https://")):
         return Path(source), empty_meta()
     workdir.mkdir(parents=True, exist_ok=True)
     errors = []
-    for name, fn in (("yt-dlp", lambda: _fetch_ytdlp(source, workdir, cookies_from_browser, cookies_file)),
-                     ("instaloader", lambda: _fetch_instaloader(source, workdir))):
+    for name, fn in (("yt-dlp", lambda: _fetch_ytdlp(source, workdir, cookies_from_browser, cookies_file, comments)),
+                     ("instaloader", lambda: _fetch_instaloader(source, workdir, comments))):
         try:
             path, meta = fn()
             # yt-dlp is great at video, instaloader at tags/location: top up missing fields if we can
             if name == "yt-dlp" and not (meta["tagged"] or meta["location"]):
                 try:
-                    _, extra = _fetch_instaloader(source, workdir)
+                    _, extra = _fetch_instaloader(source, workdir, comments)
                     for k in ("mentions", "tagged", "location"):
                         meta[k] = meta[k] or extra[k]
                     meta["comments"] = meta["comments"] or extra["comments"]

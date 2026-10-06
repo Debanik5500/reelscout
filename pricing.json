@@ -1,0 +1,5 @@
+{
+  "_note": "USD per million tokens. Edit when provider prices change. Keys are provider:model as shown in each reel's debug usage.",
+  "groq:qwen/qwen3.8-27b": {"in": 0.80, "out": 4.00, "source": "console.groq.com/docs/models (preview model)"},
+  "xai:grok-3": {"in": 3.00, "out": 15.00, "source": "xAI launch pricing via secondary sources; not on xAI's current models page, verify"}
+}

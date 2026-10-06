@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import os
 import shutil
 from dataclasses import asdict, dataclass
@@ -118,6 +119,7 @@ class PhoneStorage:
         self.images_dir = base_dir / "images"
         self.results_dir = base_dir / "results"
         self.metadata_file = base_dir / "metadata.json"
+        self._meta_lock = threading.RLock()
 
         for d in (self.frames_dir, self.images_dir, self.results_dir):
             d.mkdir(parents=True, exist_ok=True)
@@ -135,11 +137,20 @@ class PhoneStorage:
             self.metadata = {}
 
     def _save_metadata(self):
-        try:
-            with open(self.metadata_file, "w") as f:
-                json.dump(self.metadata, f)
-        except Exception:
-            pass
+        """Atomic, lock-guarded write: reels are processed on several threads at once."""
+        with self._meta_lock:
+            for _ in range(3):
+                try:
+                    payload = json.dumps(self.metadata)  # another thread may be adding a job mid-dump: retry
+                except RuntimeError:
+                    continue
+                tmp = self.metadata_file.with_name(self.metadata_file.name + ".tmp")
+                try:
+                    tmp.write_text(payload)
+                    tmp.replace(self.metadata_file)
+                except Exception:
+                    pass
+                return
 
     def _hash_content(self, content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()[:16]
@@ -308,6 +319,13 @@ class PhoneStorage:
         if result_path:
             try:
                 Path(result_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Sidecars written next to the result (context, key-moment cache, ...).
+        for sidecar in self.results_dir.glob(f"{job_id}.*"):
+            try:
+                sidecar.unlink(missing_ok=True)
             except Exception:
                 pass
 

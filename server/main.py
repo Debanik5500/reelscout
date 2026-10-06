@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import shutil
 import tempfile
@@ -12,7 +14,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends, Request, Header
-from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 import redis
@@ -24,7 +26,9 @@ from reelscout.pipeline import analyze, analyze_multi_post, analyze_reel_with_st
 from reelscout.config import Settings
 from reelscout.storage import get_phone_storage, ReelResult
 from reelscout.ingest import download_instagram
-from server.keymoments import prepare_reel
+from server import quota
+from server.jobs import manager as job_manager
+from server.keymoments import is_supported_link, prepare_live, prepare_reel
 
 
 # ─── Config ──────────────────────────────────────────────────────────────
@@ -541,13 +545,53 @@ async def get_storage_stats():
     return stats
 
 
+class SubmitReelRequest(BaseModel):
+    url: str
+
+
+@app.get("/api/v1/plans")
+async def get_plans():
+    """Plans for the subscribe page, straight from plans.json."""
+    return quota.load_plans()
+
+
+@app.get("/api/v1/me")
+async def get_me(x_device_id: Optional[str] = Header(default=None)):
+    """This device's plan and how many reels it has used this month."""
+    return quota.status(x_device_id)
+
+
+@app.post("/api/v1/reels")
+async def submit_reel(request: SubmitReelRequest, x_device_id: Optional[str] = Header(default=None)):
+    """Start processing a reel in the background. Progress arrives on /api/v1/reels/stream."""
+    url = request.url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="url must be http(s)")
+    if not is_supported_link(url):
+        raise HTTPException(status_code=422, detail="Not a reel or post link from a supported site")
+    try:
+        job = job_manager.submit(url, x_device_id)
+    except quota.QuotaExceeded as exc:
+        # 402: the app opens the plans page. Body carries the numbers it needs.
+        raise HTTPException(status_code=402, detail={"error": "quota_exceeded", **exc.status})
+    storage = get_phone_storage()
+    if job.get("existing"):
+        return {"id": job["id"], "existing": True, "reel": prepare_reel(job["id"], storage),
+                "quota": quota.status(x_device_id)}
+    return {"id": job["id"], "existing": False, "reel": prepare_live(job, storage), "quota": quota.status(x_device_id)}
+
+
 @app.get("/api/v1/reels")
 async def list_reels():
-    """Prepared reel payloads for the iOS client (one fetch, no assembly)."""
+    """Prepared reel payloads for the iOS client: live/failed jobs first, then finished reels."""
     storage = get_phone_storage()
-    reels = []
+    active = job_manager.active()
+    active_ids = {j["id"] for j in active}
+    reels = [prepare_live(j, storage) for j in active]
     jobs = sorted(storage.metadata.items(), key=lambda kv: kv[1].get("created") or "", reverse=True)
     for job_id, _meta in jobs:
+        if job_id in active_ids:
+            continue
         try:
             reel = prepare_reel(job_id, storage)
         except Exception as exc:
@@ -558,10 +602,53 @@ async def list_reels():
     return {"reels": reels}
 
 
+@app.delete("/api/v1/reels/{job_id}")
+async def dismiss_reel(job_id: str):
+    """Forget a failed job so its error card goes away. Finished and running reels are left alone."""
+    if not job_manager.dismiss(job_id):
+        raise HTTPException(status_code=409, detail="Only failed jobs can be dismissed")
+    return {"status": "dismissed", "id": job_id}
+
+
+@app.get("/api/v1/reels/stream")
+async def stream_reels(request: Request):
+    """Server-sent events: a snapshot of active jobs on connect, then one event per progress change."""
+    storage = get_phone_storage()
+    queue = job_manager.subscribe(asyncio.get_running_loop())
+
+    def frame(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    async def events():
+        try:
+            yield frame("snapshot", {"reels": [prepare_live(j, storage) for j in job_manager.active()]})
+            while not await request.is_disconnected():
+                try:
+                    job = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if job["status"] == "removed":
+                    yield frame("removed", {"id": job["id"], "canonical": job["canonical"]})
+                elif job["status"] == "ready":
+                    reel = await asyncio.to_thread(prepare_reel, job["id"], storage)
+                    yield frame("ready", {"id": job["id"], "reel": reel})
+                else:
+                    yield frame("progress", {"id": job["id"], "reel": prepare_live(job, storage)})
+        finally:
+            job_manager.unsubscribe(queue)
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.get("/api/v1/reels/{job_id}")
 async def get_reel(job_id: str):
     """Prepared payload for a single reel."""
     storage = get_phone_storage()
+    job = job_manager.get(job_id)
+    if job and job["status"] != "ready":
+        return {"reel": prepare_live(job, storage)}
     try:
         reel = prepare_reel(job_id, storage)
     except Exception as exc:

@@ -368,7 +368,7 @@ def analyze(source: str, settings: Settings | None = None, caption: str = "",
         candidates=[dict(kind=c.kind, name=c.name, url=c.url, confidence=c.score, llm_confidence=c.confidence,
                          spoken_as=c.spoken_as, evidence=c.evidence, verification=c.verification, extra=c.extra)
                     for c in cands],
-        transcript_text=" ".join(s["text"] for s in transcript),
+        transcript_text=" ".join(s["text"] for s in transcript), ocr_lines=ocr_lines,
         frame_tags=frame_tags if 'frame_tags' in locals() else [],
         llm=dict(provider=st.llm, usage=usage, error=llm_error, stages=stages_log), timings=timings,
     )
@@ -542,8 +542,13 @@ def analyze_reel_with_storage(
     max_frames: int = 20,
     fixed_hz: float | None = None,
     max_side: int = 1280,
+    frames_only: bool = False,
 ) -> ReelResult:
-    """Analyze a reel video - extract frames, save to phone storage, then process."""
+    """Analyze a reel video - extract frames, save to phone storage, then process.
+
+    frames_only=True stops after the frames (with their OCR text) are saved: no speech-to-text, extraction or
+    LLM. Callers that run `analyze` for the evidence use it so the video is not transcribed twice.
+    """
     if settings is None:
         settings = Settings()
 
@@ -595,6 +600,13 @@ def analyze_reel_with_storage(
             timings[f"ocr_{idx}"] = time.time() - t_ocr
 
     timings["frame_extraction"] = time.time() - t_extract_frames
+
+    if frames_only:
+        timings["total"] = time.time() - t0
+        result = ReelResult(job_id=job_id, status="completed", summary="", candidates=[], timings=timings,
+                            source_frames=source_frames)
+        storage.save_result(result)
+        return result
 
     # Rest of pipeline (same as analyze)
     t_asr = time.time()

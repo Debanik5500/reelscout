@@ -1,0 +1,45 @@
+{
+  "_note": "Edit freely: the app reads this from GET /api/v1/plans. 'available': false shows a plan as 'Coming soon' (no payments yet). Prices are USD per month. Cost per reel is roughly $0.013 on Groq (about $0.05 if it falls back to Grok) (up to ~$0.06 on the fallback model). App-store fees take 15-30% and every free user can cost up to ~$0.60 a month, so Plus and Pro are priced to leave room for both.",
+  "free_plan": "free",
+  "plans": [
+    {
+      "id": "free",
+      "name": "Free",
+      "monthly_reels": 5,
+      "price_usd_month": 0,
+      "tagline": "Try Kept with 5 reels every month",
+      "features": [
+        "5 reels or posts a month",
+        "Key moments, places and links",
+        "Everything stays on your phone"
+      ],
+      "available": true
+    },
+    {
+      "id": "plus",
+      "name": "Plus",
+      "monthly_reels": 20,
+      "price_usd_month": 4.99,
+      "tagline": "For people who save a few reels a week",
+      "features": [
+        "20 reels or posts a month",
+        "Everything in Free",
+        "Priority processing"
+      ],
+      "available": false
+    },
+    {
+      "id": "pro",
+      "name": "Pro",
+      "monthly_reels": 35,
+      "price_usd_month": 11.99,
+      "tagline": "For travel planners and heavy savers",
+      "features": [
+        "35 reels or posts a month",
+        "Everything in Plus",
+        "Priority processing"
+      ],
+      "available": false
+    }
+  ]
+}
